@@ -90,7 +90,6 @@ log = get_logger(__name__)
 MODEL_OPTIONS = {
     "small  (fast, ~500 MB)": "small",
     "medium (balanced, ~1.5 GB)": "medium",
-    "large-v3 (best, ~3 GB)": "large-v3",
 }
 DEFAULT_MODEL_LABEL = "medium (balanced, ~1.5 GB)"
 
@@ -155,7 +154,7 @@ class TranscriberThread(threading.Thread):
         for attempt_device, attempt_ct in [(device, compute_type), ("cpu", "int8")]:
             try:
                 # Large models on CPU require 4–6 GB RAM. Warn if it looks tight.
-                if attempt_device == "cpu" and self.model_size in ("large", "large-v2", "large-v3"):
+                if attempt_device == "cpu" and self.model_size in ("large", "large-v2"):
                     if _psutil is not None:
                         try:
                             free_gb = _psutil.virtual_memory().available / 1024 ** 3
