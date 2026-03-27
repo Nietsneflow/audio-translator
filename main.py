@@ -14,6 +14,8 @@ Prerequisites (one-time):
 """
 
 import sys
+import threading
+import traceback
 
 from logger import setup_logging
 
@@ -40,6 +42,29 @@ def _check_dependencies():
         )
 
 
+def _install_exception_hooks(log):
+    """Route all unhandled exceptions (main thread, daemon threads, tkinter
+    callbacks) into errors.log so a silent crash always leaves a trace."""
+
+    def _log_exc(exc_type, exc_value, exc_tb):
+        log.critical(
+            "Unhandled exception in main thread",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    def _log_thread_exc(args):
+        if args.exc_type is SystemExit:
+            return  # normal exit, don't log
+        log.critical(
+            "Unhandled exception in thread %r",
+            args.thread.name if args.thread else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_tb),
+        )
+
+    sys.excepthook = _log_exc
+    threading.excepthook = _log_thread_exc
+
+
 if __name__ == "__main__":
     _check_python_version()
     _check_dependencies()
@@ -47,11 +72,38 @@ if __name__ == "__main__":
 
     import logging
     log = logging.getLogger(__name__)
+    _install_exception_hooks(log)
     log.info("=== Application starting ===")
 
     # Import GUI only after deps are confirmed (avoids partial-import errors)
     from gui import App
 
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+
+        # Catch exceptions raised inside tkinter event callbacks (e.g. after(),
+        # button commands, StringVar traces).  Without this they are silently
+        # swallowed by the Tcl/Tk event loop when running under pythonw.
+        def _tk_callback_exception(exc_type, exc_value, exc_tb):
+            log.critical(
+                "Unhandled exception in tkinter callback",
+                exc_info=(exc_type, exc_value, exc_tb),
+            )
+            # Show a minimal error dialog so the user knows something went wrong
+            try:
+                import tkinter.messagebox as mb
+                tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+                mb.showerror(
+                    "Unexpected Error",
+                    f"The application encountered an unexpected error and may be "
+                    f"unstable.\n\nDetails saved to logs\\errors.log:\n\n{tb_text[-800:]}",
+                )
+            except Exception:
+                pass
+
+        app.report_callback_exception = _tk_callback_exception
+        app.mainloop()
+    except Exception:
+        log.critical("Fatal error in mainloop", exc_info=True)
+        raise
     log.info("=== Application exited ===")

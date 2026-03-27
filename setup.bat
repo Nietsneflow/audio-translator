@@ -1,4 +1,13 @@
 @echo off
+
+:: ── Logging: re-run through PowerShell Tee so all output ──
+:: ── goes to both the console AND install_log.txt           ──
+if "%1"=="--logged" goto :main
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^windowed^
+    "cmd /c '\"%~f0\" --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+exit /b %ERRORLEVEL%
+
+:main
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title Audio Translator - Installer
@@ -6,13 +15,15 @@ title Audio Translator - Installer
 echo ================================================
 echo   Audio Translator Installer
 echo ================================================
+echo Started: %DATE% %TIME%
+echo Log file: %~dp0install_log.txt
 echo.
 
 :: ── Step 1: Ensure Python is available ───────────
 python --version >nul 2>&1
 if not errorlevel 1 goto :python_ok
 
-echo Python not found. Attempting to install Python 3.11 via winget...
+echo [ERROR] Python not found. Attempting to install Python 3.11 via winget...
 echo (This requires Windows 10 version 1709 or later)
 echo.
 winget --version >nul 2>&1
@@ -39,13 +50,14 @@ goto :python_ok
 :no_winget
 :winget_failed
 echo.
-echo Could not auto-install Python.
+echo [ERROR] Could not auto-install Python.
 echo Please download and install Python 3.11 from:
 echo   https://www.python.org/downloads/
 echo.
 echo IMPORTANT: Check "Add Python to PATH" during installation.
 echo Then double-click setup.bat again.
 echo.
+echo If you need help, share install_log.txt with the person who gave you this app.
 start https://www.python.org/downloads/
 pause
 exit /b 1
@@ -62,9 +74,11 @@ echo.
 
 :: ── Step 3: Core dependencies ─────────────────────
 echo [2/3] Installing core dependencies...
-pip install "faster-whisper>=1.0.0" "soundcard>=0.4.3" "numpy>=1.24.0,<2.0" "psutil>=5.9.0" "pynvml>=11.0.0" -q
+pip install "faster-whisper>=1.0.0" "soundcard>=0.4.3" "numpy>=1.24.0,<2.0" "psutil>=5.9.0" "pynvml>=11.0.0"
 if errorlevel 1 (
-    echo ERROR: Core dependency install failed.
+    echo.
+    echo [ERROR] Core dependency install failed.
+    echo Share install_log.txt with the person who gave you this app for help.
     pause
     exit /b 1
 )
@@ -78,7 +92,10 @@ echo       If you have no NVIDIA GPU this still works - it will use CPU.
 echo.
 pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 (
-    echo ERROR: PyTorch install failed.
+    echo.
+    echo [ERROR] PyTorch install failed.
+    echo This may be a network issue or disk space issue (~3 GB required).
+    echo Share install_log.txt with the person who gave you this app for help.
     pause
     exit /b 1
 )
@@ -92,6 +109,8 @@ echo.
 echo On first launch the Whisper speech recognition model
 echo will download automatically (500 MB - 1.5 GB).
 echo.
+echo Installation finished: %DATE% %TIME%
+echo.
 set /p "LAUNCH=Launch the app now? (Y/N): "
 if /i "!LAUNCH!"=="Y" (
     start "" pythonw main.py
@@ -101,4 +120,5 @@ if /i "!LAUNCH!"=="Y" (
     echo To start later, double-click Launch.bat
 )
 echo.
+echo If you have any problems, share install_log.txt for support.
 pause

@@ -16,6 +16,11 @@ import numpy as np
 
 from logger import get_logger
 
+try:
+    import psutil as _psutil  # type: ignore[import]
+except ImportError:
+    _psutil = None  # type: ignore
+
 
 
 # Keep strong references to every AddedDllDirectory object returned by
@@ -23,6 +28,16 @@ from logger import get_logger
 # directory) when the object is garbage-collected, so we must hold onto them
 # for the lifetime of the process.
 _DLL_DIR_HANDLES: list = []
+
+# ctranslate2's GPU WhisperModel destructor throws a C++ exception when called
+# from a background thread, which propagates through Python's noexcept C-extension
+# boundary and triggers std::terminate() (Windows event 0xc0000409 in ucrtbase.dll).
+# This is a ctranslate2 bug — destructors must never throw.
+# Workaround: keep a strong reference to every retired model alive until process
+# exit.  The OS reclaims all CUDA/RAM resources on process exit without running
+# C++ destructors, so there is no crash and no leak — the VRAM/RAM is returned
+# to the system the moment the process terminates.
+_RETIRED_MODELS: list = []
 
 
 def _register_cuda_dll_dirs() -> None:
@@ -139,6 +154,22 @@ class TranscriberThread(threading.Thread):
         # If CUDA DLLs are missing at load time, fall back to CPU automatically.
         for attempt_device, attempt_ct in [(device, compute_type), ("cpu", "int8")]:
             try:
+                # Large models on CPU require 4–6 GB RAM. Warn if it looks tight.
+                if attempt_device == "cpu" and self.model_size in ("large", "large-v2", "large-v3"):
+                    if _psutil is not None:
+                        try:
+                            free_gb = _psutil.virtual_memory().available / 1024 ** 3
+                            if free_gb < 4.0:
+                                self.on_status(
+                                    f"WARNING: '{self.model_size}' on CPU needs ~4–6 GB free RAM "
+                                    f"(only {free_gb:.1f} GB available). Loading may fail or be very slow."
+                                )
+                                log.warning(
+                                    "Low RAM for large model on CPU: %.1f GB free", free_gb
+                                )
+                        except Exception:
+                            pass
+
                 model = WhisperModel(self.model_size, device=attempt_device, compute_type=attempt_ct)
                 if attempt_device != device:
                     log.warning(
@@ -153,12 +184,31 @@ class TranscriberThread(threading.Thread):
                 log.info("Model '%s' loaded on %s", self.model_size, attempt_device.upper())
                 self.on_device_info(attempt_device, attempt_ct)
                 break
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Model load failed on %s: %s", attempt_device, exc)
+            except MemoryError:
+                log.error("Out of memory loading '%s' on %s", self.model_size, attempt_device)
                 if attempt_device == "cpu":
-                    log.exception("CPU fallback also failed")
-                    self.on_error(f"Failed to load Whisper model: {exc}")
+                    self.on_error(
+                        f"Not enough RAM to load the '{self.model_size}' model.\n"
+                        f"Try a smaller model (medium or small) or free up memory."
+                    )
                     return
+            except Exception as exc:  # noqa: BLE001
+                err_str = str(exc)
+                # ctranslate2 OOM surfaces as a RuntimeError with "out of memory" text
+                if "out of memory" in err_str.lower() or "alloc" in err_str.lower():
+                    log.error("OOM loading '%s' on %s: %s", self.model_size, attempt_device, exc)
+                    if attempt_device == "cpu":
+                        self.on_error(
+                            f"Not enough memory to load the '{self.model_size}' model.\n"
+                            f"Try a smaller model (medium or small)."
+                        )
+                        return
+                else:
+                    log.warning("Model load failed on %s: %s", attempt_device, exc)
+                    if attempt_device == "cpu":
+                        log.exception("CPU fallback also failed")
+                        self.on_error(f"Failed to load Whisper model: {exc}")
+                        return
 
         if model is None:
             self.on_error("Could not load Whisper model on any device.")
@@ -265,13 +315,18 @@ class TranscriberThread(threading.Thread):
                     seq_label, info.language, info.language_probability
                 )
                 for segment in segments:
-                    if self._stop_event.is_set():
-                        break
                     text = segment.text.strip()
                     if text:
                         ts = time.strftime("%H:%M:%S")
                         log.info("[%s] %s %s", ts, seq_label, text)
                         self.on_result(ts, text)
+                # Never break out of the segment generator mid-inference.
+                # Interrupting the lazy ctranslate2 generator leaves its
+                # internal C++ decoder state allocated; when the model is
+                # later GC'd the destructor crashes with std::terminate()
+                # (exception code 0xc0000409 in ucrtbase.dll).  Instead we
+                # let the current utterance finish, then the outer while
+                # loop's stop-event check exits cleanly.
                 self.on_status("Listening…")
             except Exception as exc:  # noqa: BLE001
                 # Detect missing CUDA DLL errors and retry on CPU rather than
@@ -283,7 +338,7 @@ class TranscriberThread(threading.Thread):
                     try:
                         model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
                         device = "cpu"
-                        log.warning("Switched to CPU (int8) after CUDA DLL failure")
+                        log.warning("Permanently switched to CPU (int8) after CUDA DLL failure")
                         self.on_device_info("cpu", "int8")
                         self.on_status("Switched to CPU. Install nvidia-cublas-cu12 for GPU.")
                         # Re-queue this batch so it gets translated
@@ -294,6 +349,14 @@ class TranscriberThread(threading.Thread):
                 else:
                     log.exception("Transcription error on %s", seq_label)
                     self.on_error(f"Transcription error: {exc}")
+
+        # Park the model in _RETIRED_MODELS so Python's GC never runs
+        # ctranslate2's crashing C++ destructor.  See module-level comment.
+        try:
+            _RETIRED_MODELS.append(model)
+            log.debug("Model parked in _RETIRED_MODELS (destructor suppressed)")
+        except Exception:
+            pass
 
         log.info("TranscriberThread stopped")
         self.on_status("Stopped.")

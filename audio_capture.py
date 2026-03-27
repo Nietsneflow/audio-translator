@@ -32,8 +32,17 @@ PRE_ROLL_FRAMES = int(PRE_ROLL_MS / FRAME_MS)         # 10 frames
 
 # How long silence must persist (after speech) before we consider the
 # utterance finished and ship it for translation.
-END_SILENCE_MS = 900
-END_SILENCE_FRAMES = int(END_SILENCE_MS / FRAME_MS)   # 30 frames
+# This is the *base* (minimum) gate — for short utterances it may scale up.
+END_SILENCE_MS = 300
+END_SILENCE_FRAMES = int(END_SILENCE_MS / FRAME_MS)   # 10 frames
+
+# For longer utterances the silence gate scales up so a brief pause mid-sentence
+# doesn't prematurely cut off a fast speaker (e.g. Spanish).
+# Every SCALE_PER_SEC_MS of speech adds SCALE_STEP_MS to the gate, capped at
+# END_SILENCE_MAX_MS.
+SCALE_PER_SEC_MS  = 3_000   # add extra time for every 3 s of speech so far
+SCALE_STEP_MS     = 150     # extra ms added per 3 s block
+END_SILENCE_MAX_MS = 900    # hard ceiling
 
 # When in TRAILING state, how many *consecutive* speech frames are needed
 # to flip back to SPEAKING.  A single micro-blip (e.g. VoiceMeeter noise
@@ -124,10 +133,17 @@ class AudioCaptureThread(threading.Thread):
         ("error",  str)         — fatal error; thread will exit
     """
 
-    def __init__(self, audio_queue: queue.Queue, device_name: str | None = None):
+    def __init__(self, audio_queue: queue.Queue, device_name: str | None = None,
+                 speech_threshold: float = SPEECH_THRESHOLD,
+                 end_silence_ms: int = END_SILENCE_MS,
+                 on_level=None):
         super().__init__(daemon=True, name="AudioCaptureThread")
         self.audio_queue = audio_queue
         self.device_name = device_name
+        self.speech_threshold = speech_threshold
+        self.end_silence_ms = end_silence_ms  # base gate; may scale up adaptively
+        self._on_level = on_level  # callable(rms: float) or None
+        self._level_frame_count = 0
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -193,7 +209,12 @@ class AudioCaptureThread(threading.Thread):
                         raw_buf = raw_buf[FRAME_SAMPLES:]
 
                         rms = float(np.sqrt(np.mean(frame ** 2)))
-                        is_speech = rms > SPEECH_THRESHOLD
+                        is_speech = rms > self.speech_threshold
+                        # Notify level meter — throttled to every 2nd frame (~15 fps)
+                        if self._on_level is not None:
+                            self._level_frame_count += 1
+                            if self._level_frame_count % 2 == 0:
+                                self._on_level(rms)
 
                         if state == _SILENT:
                             pre_roll.append(frame)
@@ -236,10 +257,18 @@ class AudioCaptureThread(threading.Thread):
                             else:
                                 trail_speech_run = 0
                                 silence_frame_count += 1
-                                if silence_frame_count >= END_SILENCE_FRAMES:
+                                # Adaptive gate: scale end-silence up with utterance length
+                                utterance_ms = len(utterance_frames) * FRAME_MS
+                                scale_steps = int(utterance_ms / SCALE_PER_SEC_MS)
+                                adaptive_ms = min(
+                                    self.end_silence_ms + scale_steps * SCALE_STEP_MS,
+                                    END_SILENCE_MAX_MS
+                                )
+                                adaptive_frames = max(2, int(adaptive_ms / FRAME_MS))
+                                if silence_frame_count >= adaptive_frames:
                                     log.debug(
-                                        "VAD: silence threshold reached (%d frames)",
-                                        silence_frame_count
+                                        "VAD: silence gate reached (%d ms, utterance %.1f s)",
+                                        adaptive_ms, utterance_ms / 1000
                                     )
                                     _emit()
                                     self.audio_queue.put(("status", "Listening…"))

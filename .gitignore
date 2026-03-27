@@ -1,8 +1,10 @@
 # Logs
 logs/
 
-# Output buffer
+# Runtime-generated files
 output.txt
+install_log.txt
+config.json
 
 # Python cache
 __pycache__/
