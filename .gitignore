@@ -1,0 +1,20 @@
+# Logs
+logs/
+
+# Output buffer
+output.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# HuggingFace model cache (downloaded at runtime)
+.cache/
+
+# VS Code
+.vscode/
