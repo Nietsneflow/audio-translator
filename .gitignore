@@ -4,7 +4,7 @@ logs/
 # Runtime-generated files
 output.txt
 install_log.txt
-config.json
+/config.json
 
 # Python cache
 __pycache__/
@@ -17,6 +17,9 @@ venv/
 
 # HuggingFace model cache (downloaded at runtime)
 .cache/
+
+# Bundled model weights — too large for git (track config/tokenizer files only)
+models/**/model.bin
 
 # VS Code
 .vscode/

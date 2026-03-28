@@ -85,11 +85,28 @@ _register_cuda_dll_dirs()
 
 log = get_logger(__name__)
 
+# Local models directory — bundled alongside the script so no internet download
+# is needed.  Structure: models/<size>/model.bin + config.json + tokenizer.json
+# + vocabulary.txt.  If the folder for a given size is missing, faster-whisper
+# falls back to downloading from HuggingFace automatically.
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+def _resolve_model_path(model_size: str) -> str:
+    """Return local path if bundled models exist, else the HuggingFace model ID."""
+    local = os.path.join(_MODELS_DIR, model_size)
+    if os.path.isfile(os.path.join(local, "model.bin")):
+        log.debug("Using bundled local model: %s", local)
+        return local
+    log.debug("Local model not found for '%s', will download from HuggingFace", model_size)
+    return model_size
+
 
 # Maps UI labels to faster-whisper model size strings
 MODEL_OPTIONS = {
     "small  (fast, ~500 MB)": "small",
     "medium (balanced, ~1.5 GB)": "medium",
+    "large  (best quality, ~3 GB)": "large-v2",
 }
 DEFAULT_MODEL_LABEL = "medium (balanced, ~1.5 GB)"
 
@@ -179,7 +196,7 @@ class TranscriberThread(threading.Thread):
                             pass
 
                 model = WhisperModel(
-                    self.model_size,
+                    _resolve_model_path(self.model_size),
                     device=attempt_device,
                     compute_type=attempt_ct,
                     # Limit CPU threads used for pre/post-processing work that
@@ -357,14 +374,27 @@ class TranscriberThread(threading.Thread):
                 time.sleep(0.15)
             except Exception as exc:  # noqa: BLE001
                 err_str = str(exc).lower()
-                cuda_failure = device == "cuda" and (
+                # mkl_malloc failure = Intel MKL can't get RAM — happens when the
+                # game's loading screen temporarily consumes most system RAM.
+                # Transient: wait for loading to finish, skip utterance, continue.
+                ram_pressure = "mkl_malloc" in err_str or "mkl-service" in err_str
+                cuda_failure = device == "cuda" and not ram_pressure and (
                     "dll" in err_str
                     or "library" in err_str
                     or "out of memory" in err_str
                     or "bad allocation" in err_str
                     or isinstance(exc, MemoryError)
                 )
-                if cuda_failure:
+                if ram_pressure:
+                    log.warning("RAM pressure on %s (%s) — waiting 2 s then retrying", seq_label, exc)
+                    self.on_status("Low RAM (game loading?) — pausing, will retry…")
+                    time.sleep(2.0)  # wait for loading screen to release RAM
+                    # Re-queue the utterance so it gets translated once RAM frees up.
+                    # The audio data itself is safe — it lives in Python's heap, not
+                    # MKL's allocation arena.  Only MKL's internal scratchpad failed.
+                    self.audio_queue.put(("audio", audio_data))
+                    self.on_status("Listening…")
+                elif cuda_failure:
                     # GPU ran out of VRAM (game took it all) or CUDA DLL missing.
                     # Fall back to CPU silently and keep the session running —
                     # do NOT call on_error() which would stop the app.
@@ -382,7 +412,7 @@ class TranscriberThread(threading.Thread):
                             pass
                         _RETIRED_MODELS.append(model)  # suppress crashing destructor
                         model = WhisperModel(
-                            self.model_size, device="cpu", compute_type="int8",
+                            _resolve_model_path(self.model_size), device="cpu", compute_type="int8",
                             cpu_threads=2, num_workers=1,
                         )
                         device = "cpu"
