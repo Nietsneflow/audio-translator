@@ -151,6 +151,15 @@ class AudioCaptureThread(threading.Thread):
 
     def run(self):
         log.info("AudioCaptureThread starting (device=%r)", self.device_name)
+        # Lower this thread's priority so the OS always gives the game/GPU
+        # driver first access to CPU time.  THREAD_PRIORITY_BELOW_NORMAL = -1.
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadPriority(
+                ctypes.windll.kernel32.GetCurrentThread(), -1
+            )
+        except Exception:
+            pass
         try:
             device = get_loopback_device(self.device_name)
         except RuntimeError as exc:

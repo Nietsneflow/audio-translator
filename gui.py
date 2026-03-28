@@ -9,6 +9,7 @@ import collections
 import json
 import os
 import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
@@ -54,7 +55,7 @@ class App(tk.Tk):
         self._transcriber_thread: TranscriberThread | None = None
         self._running = False
         self._poll_id: str | None = None  # after() handle for queue-depth polling
-        self._stats_poll_id: str | None = None  # after() handle for stats polling
+        self._stats_stop = threading.Event()  # signals the stats thread to exit
         self._device_info: tuple[str, str] | None = None  # (device, compute_type)
         self._output_lines: collections.deque = collections.deque(maxlen=20)
         self._output_file = os.path.join(
@@ -290,7 +291,7 @@ class App(tk.Tk):
         tk.Label(stats_frame, text="VRAM", **lbl_kw).pack(side=tk.LEFT)
         tk.Label(stats_frame, textvariable=self._stats_vram_var, **val_kw).pack(side=tk.LEFT)
 
-        self._poll_stats()  # start immediately
+        self._start_stats_thread()  # start immediately
 
         self._status_var = tk.StringVar(value="Ready.")
         tk.Label(
@@ -517,40 +518,42 @@ class App(tk.Tk):
 
     # ── performance stats polling ─────────────────────────────────────────────
 
-    def _poll_stats(self):
-        """Kick off a daemon thread to collect stats, then schedule the next poll."""
-        import threading
-        threading.Thread(target=self._collect_stats, daemon=True).start()
-        self._stats_poll_id = self.after(2000, self._poll_stats)
+    def _start_stats_thread(self):
+        """Start a single persistent daemon thread that polls stats every 2 s."""
+        t = threading.Thread(target=self._stats_loop, daemon=True, name="StatsThread")
+        t.start()
 
-    def _collect_stats(self):
-        """Run in a background thread — never blocks the tkinter main loop."""
-        cpu_str = ram_str = gpu_str = vram_str = "n/a"
+    def _stats_loop(self):
+        """Persistent stats thread — polls every 2 s until window closes."""
+        while not self._stats_stop.wait(timeout=2.0):
+            cpu_str = ram_str = gpu_str = vram_str = "n/a"
 
-        if _psutil is not None:
+            if _psutil is not None:
+                try:
+                    cpu = _psutil.cpu_percent(interval=None)
+                    ram = _psutil.virtual_memory()
+                    cpu_str = f"{cpu:.0f}%"
+                    ram_str = f"{ram.used / 1024**3:.1f} / {ram.total / 1024**3:.1f} GB"
+                except Exception:
+                    pass
+
+            if _NVML_OK:
+                try:
+                    handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = _pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    mem = _pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    gpu_str = f"{util.gpu}%"
+                    vram_str = f"{mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} GB"
+                except Exception:
+                    pass
+
             try:
-                cpu = _psutil.cpu_percent(interval=None)
-                ram = _psutil.virtual_memory()
-                cpu_str = f"{cpu:.0f}%"
-                ram_str = f"{ram.used / 1024**3:.1f} / {ram.total / 1024**3:.1f} GB"
+                self.after(0, self._stats_cpu_var.set, cpu_str)
+                self.after(0, self._stats_ram_var.set, ram_str)
+                self.after(0, self._stats_gpu_var.set, gpu_str)
+                self.after(0, self._stats_vram_var.set, vram_str)
             except Exception:
-                pass
-
-        if _NVML_OK:
-            try:
-                handle = _pynvml.nvmlDeviceGetHandleByIndex(0)
-                util = _pynvml.nvmlDeviceGetUtilizationRates(handle)
-                mem = _pynvml.nvmlDeviceGetMemoryInfo(handle)
-                gpu_str = f"{util.gpu}%"
-                vram_str = f"{mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} GB"
-            except Exception:
-                pass
-
-        # Post results back to the main thread
-        self.after(0, self._stats_cpu_var.set, cpu_str)
-        self.after(0, self._stats_ram_var.set, ram_str)
-        self.after(0, self._stats_gpu_var.set, gpu_str)
-        self.after(0, self._stats_vram_var.set, vram_str)
+                break  # window destroyed
 
     # ── thread-safe callbacks (called from background threads) ────────────────
 
@@ -704,5 +707,6 @@ class App(tk.Tk):
 
     def _on_close(self):
         self._save_config()
+        self._stats_stop.set()  # signal stats thread to exit cleanly
         self._stop()
         self.after(300, self.destroy)

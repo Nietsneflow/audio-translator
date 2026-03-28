@@ -73,6 +73,19 @@ if __name__ == "__main__":
     import logging
     log = logging.getLogger(__name__)
     _install_exception_hooks(log)
+
+    # Lower the whole process to below-normal priority so the OS and GPU
+    # scheduler always favour foreground apps (games, video) over translation.
+    # BELOW_NORMAL_PRIORITY_CLASS = 0x4000
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(), 0x4000
+        )
+        log.info("Process priority set to BELOW_NORMAL")
+    except Exception:
+        pass
+
     log.info("=== Application starting ===")
 
     # Import GUI only after deps are confirmed (avoids partial-import errors)
