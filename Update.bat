@@ -50,14 +50,25 @@ if errorlevel 1 (
     echo.
 )
 
-:: Check this folder is a git repository
+:: Check this folder is a git repository — if not, initialize it and connect to GitHub
 git rev-parse --git-dir >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: This folder was not set up via Git.
+    echo This folder is not connected to Git. Setting it up now...
     echo.
-    echo Update.bat only works if the app was installed by cloning the repository.
-    echo Please ask for a fresh install link or re-run setup.bat.
-    goto :done
+    git init
+    git remote add origin https://github.com/Nietsneflow/audio-translator.git
+    git fetch origin main
+    git reset --hard origin/main
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Could not connect to the update server.
+        echo Please check your internet connection and try again.
+        goto :done
+    )
+    echo.
+    echo Folder connected to Git successfully.
+    echo.
+    goto :post_pull
 )
 
 :: Pull latest changes
@@ -69,6 +80,8 @@ if errorlevel 1 (
     echo Update failed. Check the error above.
     goto :done
 )
+
+:post_pull
 
 :: Update Python dependencies in case requirements.txt changed
 echo.
