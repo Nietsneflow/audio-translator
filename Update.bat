@@ -71,6 +71,19 @@ if errorlevel 1 (
     echo Dependencies are up to date.
 )
 
+:: Download / verify the English→Russian translation pack
+echo.
+echo Setting up translation (English to Russian)...
+echo This may download ~80 MB the first time. Please wait...
+echo.
+python download_translation_model.py
+if errorlevel 1 (
+    echo WARNING: Translation setup had errors. The app will still work,
+    echo but the Translate English to Russian feature may not be available.
+) else (
+    echo Translation is ready.
+)
+
 echo.
 echo =============================================
 echo   Update complete! You can close this window.
