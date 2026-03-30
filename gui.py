@@ -457,41 +457,63 @@ class App(tk.Tk):
         self._rebuild_sources_menu()
 
     def _rebuild_sources_menu(self):
-        """Rebuild the Sources dropdown reflecting current S1/S2 selections."""
+        """Rebuild the Sources dropdown as a two-entry cascade tree.
+
+        Sources ▾
+          Source 1 ►  device A
+                      ✓ device B   ← currently selected
+                      device C
+          Source 2 ►  (disabled)   ← toggle off
+                      device A
+                      ✓ device B   ← currently selected
+                      device C  (Already Source 1, grayed)
+        """
         menu = self._sources_menu
         menu.delete(0, "end")
         devices = getattr(self, "_all_devices", [])
 
-        menu.add_command(label="── Source 1 ──", state="disabled")
+        menu_kw = dict(tearoff=0, bg=ENTRY_BG, fg=FG,
+                       activebackground="#3e3e5e", activeforeground=FG)
+
+        # ── Source 1 cascade ─────────────────────────────────────────────────
+        sub1 = tk.Menu(menu, **menu_kw)
         for name in devices:
             if name == self._s2_device:
-                menu.add_command(label=f"  {name}  (Already Source 2)",
-                                 foreground="#6c7086",
-                                 command=lambda n=name: self._select_source(1, n))
-            elif name == self._s1_device:
-                menu.add_command(label=f"✓ {name}",
-                                 command=lambda n=name: self._select_source(1, n))
+                sub1.add_command(
+                    label=f"  {name}  (Already S2)",
+                    foreground="#6c7086",
+                    command=lambda n=name: self._select_source(1, n),
+                )
             else:
-                menu.add_command(label=f"  {name}",
-                                 command=lambda n=name: self._select_source(1, n))
+                sub1.add_command(
+                    label=f"✓ {name}" if name == self._s1_device else f"  {name}",
+                    command=lambda n=name: self._select_source(1, n),
+                )
+        s1_label = f"Source 1  [{self._s1_device or 'none'}]" if self._s1_device else "Source 1  [none]"
+        menu.add_cascade(label=s1_label, menu=sub1)
 
-        menu.add_separator()
-        menu.add_command(label="── Source 2 ──", state="disabled")
-        menu.add_command(
+        # ── Source 2 cascade ─────────────────────────────────────────────────
+        sub2 = tk.Menu(menu, **menu_kw)
+        sub2.add_command(
             label="✓ (disabled)" if not self._s2_device else "  (disabled)",
-            command=lambda: self._select_source(2, None)
+            command=lambda: self._select_source(2, None),
         )
+        if devices:
+            sub2.add_separator()
         for name in devices:
             if name == self._s1_device:
-                menu.add_command(label=f"  {name}  (Already Source 1)",
-                                 foreground="#6c7086",
-                                 command=lambda n=name: self._select_source(2, n))
-            elif name == self._s2_device:
-                menu.add_command(label=f"✓ {name}",
-                                 command=lambda n=name: self._select_source(2, n))
+                sub2.add_command(
+                    label=f"  {name}  (Already S1)",
+                    foreground="#6c7086",
+                    command=lambda n=name: self._select_source(2, n),
+                )
             else:
-                menu.add_command(label=f"  {name}",
-                                 command=lambda n=name: self._select_source(2, n))
+                sub2.add_command(
+                    label=f"✓ {name}" if name == self._s2_device else f"  {name}",
+                    command=lambda n=name: self._select_source(2, n),
+                )
+        s2_label = f"Source 2  [{self._s2_device}]" if self._s2_device else "Source 2  [disabled]"
+        menu.add_cascade(label=s2_label, menu=sub2)
 
     def _select_source(self, source_num: int, device_name: str | None):
         """Called when user picks a device for Source 1 or 2."""
