@@ -3,6 +3,8 @@ logs/
 
 # Runtime-generated files
 output.txt
+Source1.txt
+Source2.txt
 install_log.txt
 /config.json
 
