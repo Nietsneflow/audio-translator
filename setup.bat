@@ -3,7 +3,7 @@
 :: ── Logging: re-run through PowerShell Tee so all output ──
 :: ── goes to both the console AND install_log.txt           ──
 if "%1"=="--logged" goto :main
-powershell -NoProfile -ExecutionPolicy Bypass -Command "cmd /c '%~f0 --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "cmd /c '\"%~f0\" --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
 exit /b %ERRORLEVEL%
 
 :main
