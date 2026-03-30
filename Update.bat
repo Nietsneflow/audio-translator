@@ -51,7 +51,7 @@ if errorlevel 1 (
 )
 
 :: Check this folder is a git repository
-if not exist ".git" (
+if not exist "%~dp0.git" (
     echo ERROR: This folder was not set up via Git.
     echo.
     echo Update.bat only works if the app was installed by cloning the repository.
