@@ -97,6 +97,72 @@ _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 _TRANSLATION_MODEL_DIR = os.path.join(_MODELS_DIR, "opus-mt-en-ru")
 
 
+# ── Hallucination filters ─────────────────────────────────────────────────────
+
+# Common single-word / short-phrase Whisper hallucinations on near-silence.
+# All comparisons are done lower-case with punctuation stripped.
+_PHANTOM_PHRASES: frozenset[str] = frozenset({
+    "bye", "bye-bye", "bye bye", "goodbye", "good bye",
+    "thanks", "thank you", "thank you.", "thanks.",
+    "thanks for watching", "thank you for watching",
+    "you", ".", "!", "...", "hmm", "hm", "um", "uh",
+    "i", "oh", "ah", "okay", "ok", "yes", "no",
+    "subscribe", "like and subscribe",
+})
+
+
+def _strip_punct(text: str) -> str:
+    """Lowercase and strip leading/trailing punctuation for comparison."""
+    return text.lower().strip(".,!?;:…- \t\n")
+
+
+def _is_phantom(text: str, no_speech_prob: float, avg_logprob: float) -> bool:
+    """Return True if the segment looks like a hallucination on near-silence."""
+    stripped = _strip_punct(text)
+    # Known phantom phrase list — language-model favourite fillers on silence
+    if stripped in _PHANTOM_PHRASES:
+        log.debug("Suppressed phantom phrase: %r", text)
+        return True
+    # Very short output with weak confidence is almost certainly noise
+    word_count = len(stripped.split())
+    if word_count <= 2 and avg_logprob < -0.8:
+        log.debug("Suppressed low-confidence short segment (logprob=%.2f): %r", avg_logprob, text)
+        return True
+    # Segment-level no-speech probability above 0.7 even if global threshold passed
+    if no_speech_prob > 0.7:
+        log.debug("Suppressed high no_speech_prob=%.2f segment: %r", no_speech_prob, text)
+        return True
+    return False
+
+
+def _is_repetition_loop(text: str, min_repeats: int = 6) -> bool:
+    """Return True if *text* is a Whisper repetition loop.
+
+    Checks n-grams of size 1–4.  A phrase repeated *min_repeats* or more times
+    accounts for the vast majority of the segment — a clear hallucination loop.
+    """
+    words = text.split()
+    total = len(words)
+    if total < min_repeats * 2:
+        return False
+    for n in range(1, 5):
+        if total < n:
+            break
+        ngrams = [tuple(words[i: i + n]) for i in range(total - n + 1)]
+        if not ngrams:
+            continue
+        most_common = max(set(ngrams), key=ngrams.count)
+        count = ngrams.count(most_common)
+        # If the most-common n-gram makes up >60% of all n-gram slots, it's a loop
+        if count >= min_repeats and count / len(ngrams) > 0.60:
+            log.debug(
+                "Suppressed repetition loop (n=%d, count=%d, phrase=%r): %r",
+                n, count, " ".join(most_common), text[:120],
+            )
+            return True
+    return False
+
+
 def _load_opus_translator(on_status):
     """Lazily load the local OPUS-MT en→ru model.
 
@@ -399,6 +465,8 @@ class TranscriberThread(threading.Thread):
                         without_timestamps=True,           # skip timestamp decode pass
                         vad_filter=True,
                         vad_parameters={"min_silence_duration_ms": 300},
+                        repetition_penalty=1.3,    # penalise repeated tokens — suppresses
+                                                   # "Come on, come on, come on..." loops
                     )
                     log.debug(
                         "%s — language=%s (prob=%.2f)",
@@ -408,6 +476,16 @@ class TranscriberThread(threading.Thread):
                         text = segment.text.strip()
                         if not text:
                             continue
+                        # ── Hallucination filters ────────────────────────────────
+                        if _is_repetition_loop(text):
+                            continue
+                        if _is_phantom(
+                            text,
+                            getattr(segment, "no_speech_prob", 0.0),
+                            getattr(segment, "avg_logprob", 0.0),
+                        ):
+                            continue
+                        # ───────────────────────────────────────────────
                         ts = time.strftime("%H:%M:%S")
                         log.info("[%s] %s %s", ts, seq_label, text)
                         self.on_result(ts, text, info.language, grp_src)
