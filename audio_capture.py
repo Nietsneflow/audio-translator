@@ -136,17 +136,17 @@ class AudioCaptureThread(threading.Thread):
     def __init__(self, audio_queue: queue.Queue, device_name: str | None = None,
                  speech_threshold: float = SPEECH_THRESHOLD,
                  end_silence_ms: int = END_SILENCE_MS,
-                 on_level=None):
-        super().__init__(daemon=True, name="AudioCaptureThread")
+                 on_level=None,
+                 source_id: int = 1):
+        super().__init__(daemon=True, name=f"AudioCaptureThread-S{source_id}")
         self.audio_queue = audio_queue
         self.device_name = device_name
         self.speech_threshold = speech_threshold
         self.end_silence_ms = end_silence_ms  # base gate; may scale up adaptively
         self._on_level = on_level  # callable(rms: float) or None
+        self.source_id = source_id
         self._level_frame_count = 0
         self._stop_event = threading.Event()
-
-    def stop(self):
         self._stop_event.set()
 
     def run(self):
@@ -191,8 +191,8 @@ class AudioCaptureThread(threading.Thread):
                     "Utterance emitted: %.2f s (%d speech frames)",
                     len(audio) / SAMPLE_RATE, speech_frame_count
                 )
-                self.audio_queue.put(("audio", audio))
-                self.audio_queue.put(("status", "Processing…"))
+                self.audio_queue.put(("audio", audio, self.source_id))
+                self.audio_queue.put(("status", "Processing…", self.source_id))
             else:
                 log.debug("Discarded short noise burst (%d speech frames)", speech_frame_count)
             utterance_frames = []
@@ -204,7 +204,7 @@ class AudioCaptureThread(threading.Thread):
         try:
             with device.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=block_size) as rec:
                 log.info("Recording started — VAD active")
-                self.audio_queue.put(("status", "Listening…"))
+                self.audio_queue.put(("status", "Listening…", self.source_id))
 
                 while not self._stop_event.is_set():
                     block = rec.record(numframes=block_size)
@@ -234,7 +234,7 @@ class AudioCaptureThread(threading.Thread):
                                 speech_frame_count = 1
                                 silence_frame_count = 0
                                 state = _SPEAKING
-                                self.audio_queue.put(("status", "Speech detected…"))
+                                self.audio_queue.put(("status", "Speech detected…", self.source_id))
                                 log.debug("VAD: SILENT → SPEAKING (rms=%.4f)", rms)
 
                         elif state == _SPEAKING:
@@ -280,15 +280,15 @@ class AudioCaptureThread(threading.Thread):
                                         adaptive_ms, utterance_ms / 1000
                                     )
                                     _emit()
-                                    self.audio_queue.put(("status", "Listening…"))
+                                    self.audio_queue.put(("status", "Listening…", self.source_id))
                             # Safety cap
                             if len(utterance_frames) >= MAX_UTTERANCE_FRAMES:
                                 log.info("VAD: max utterance length reached — force emit")
                                 _emit()
-                                self.audio_queue.put(("status", "Listening…"))
+                                self.audio_queue.put(("status", "Listening…", self.source_id))
 
         except Exception as exc:  # noqa: BLE001
             log.exception("Fatal capture error")
-            self.audio_queue.put(("error", f"Capture error: {exc}"))
+            self.audio_queue.put(("error", f"Capture error: {exc}", self.source_id))
         finally:
             log.info("AudioCaptureThread stopped")

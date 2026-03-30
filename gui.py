@@ -52,13 +52,22 @@ class App(tk.Tk):
 
         self._audio_queue: queue.Queue = queue.Queue()  # unbounded — capture never blocks
         self._capture_thread: AudioCaptureThread | None = None
+        self._capture_thread_s2: AudioCaptureThread | None = None
         self._transcriber_thread: TranscriberThread | None = None
         self._running = False
         self._poll_id: str | None = None  # after() handle for queue-depth polling
         self._stats_stop = threading.Event()  # signals the stats thread to exit
         self._device_info: tuple[str, str] | None = None  # (device, compute_type)
         self._output_lines: collections.deque = collections.deque(maxlen=20)
+        self._s2_output_lines: collections.deque = collections.deque(maxlen=20)
+        self._combined_output_lines: collections.deque = collections.deque(maxlen=40)
         self._output_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "Source1.txt"
+        )
+        self._s2_output_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "Source2.txt"
+        )
+        self._combined_output_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output.txt"
         )
         self._config_file = os.path.join(
@@ -71,14 +80,27 @@ class App(tk.Tk):
         saved_silence = int(self._load_config().get("end_silence_ms", END_SILENCE_MS))
         self._silence_var = tk.IntVar(value=saved_silence)
         self._silence_display_var = tk.StringVar(value=f"{saved_silence} ms")
+
+        _cfg2 = self._load_config()
+        s2_thresh = _cfg2.get("s2_threshold", SPEECH_THRESHOLD)
+        self._s2_threshold_var = tk.DoubleVar(value=s2_thresh)
+        self._s2_threshold_display_var = tk.StringVar(value=f"{s2_thresh:.3f}")
+        s2_sil = int(_cfg2.get("s2_end_silence_ms", END_SILENCE_MS))
+        self._s2_silence_var = tk.IntVar(value=s2_sil)
+        self._s2_silence_display_var = tk.StringVar(value=f"{s2_sil} ms")
+
         self._meter_visible = False
         self._meter_peak = 0.0
+        self._s2_meter_peak = 0.0
 
         _cfg = self._load_config()
         self._saved_model = _cfg.get("model", DEFAULT_MODEL_LABEL)
         self._saved_processor = _cfg.get("processor", "Auto")
-        self._saved_device = _cfg.get("device", None)
+        self._saved_device = _cfg.get("device", None)  # legacy fallback
+        self._s1_device = _cfg.get("s1_device", _cfg.get("device", None))
+        self._s2_device = _cfg.get("s2_device", None)  # None = disabled
         self._ts_in_output_var = tk.BooleanVar(value=_cfg.get("ts_in_output", True))
+        self._show_lang_tag_var = tk.BooleanVar(value=_cfg.get("show_lang_tag", False))
 
         self._build_ui()
         self._refresh_devices()
@@ -91,50 +113,51 @@ class App(tk.Tk):
         ctrl = tk.Frame(self, bg=BG, pady=8, padx=10)
         ctrl.pack(fill=tk.X)
 
-        # Columns 1 (device combo) and 4 (model combo) absorb spare width.
-        # Weight 2 vs 1 gives the device combo roughly twice the extra space.
-        ctrl.columnconfigure(1, weight=2)
-        ctrl.columnconfigure(4, weight=1)
+        # Column 3 (model combo) absorbs spare width.
+        ctrl.columnconfigure(3, weight=1)
 
-        # Device selector
-        tk.Label(ctrl, text="Audio device:", bg=BG, fg=FG).grid(
-            row=0, column=0, sticky=tk.W
+        # Sources dropdown button
+        self._sources_btn = tk.Menubutton(
+            ctrl, text="Sources ▾", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
+            font=("Segoe UI", 10), padx=10, pady=4, cursor="hand2",
+            activebackground="#3e3e5e", activeforeground=FG
         )
-        self._device_var = tk.StringVar()
-        self._device_combo = ttk.Combobox(
-            ctrl, textvariable=self._device_var, state="readonly"
+        self._sources_menu = tk.Menu(
+            self._sources_btn, tearoff=0, bg=ENTRY_BG, fg=FG,
+            activebackground="#3e3e5e", activeforeground=FG,
+            selectcolor=FG
         )
-        self._device_combo.grid(row=0, column=1, padx=(4, 4), sticky=tk.EW)
-        self._device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
+        self._sources_btn["menu"] = self._sources_menu
+        self._sources_btn.grid(row=0, column=0, padx=(0, 12), sticky=tk.W)
 
         refresh_btn = tk.Button(
             ctrl, text="↺", bg=ENTRY_BG, fg=ACCENT, relief=tk.FLAT,
             command=self._refresh_devices, cursor="hand2"
         )
-        refresh_btn.grid(row=0, column=2, padx=(0, 12))
+        refresh_btn.grid(row=0, column=1, padx=(0, 12))
 
         # Model selector
         tk.Label(ctrl, text="Model:", bg=BG, fg=FG).grid(
-            row=0, column=3, sticky=tk.W
+            row=0, column=2, sticky=tk.W
         )
         self._model_var = tk.StringVar(value=self._saved_model)
         self._model_combo = ttk.Combobox(
             ctrl, textvariable=self._model_var,
             values=list(MODEL_OPTIONS.keys()), state="readonly"
         )
-        self._model_combo.grid(row=0, column=4, padx=(4, 12), sticky=tk.EW)
+        self._model_combo.grid(row=0, column=3, padx=(4, 12), sticky=tk.EW)
         self._model_combo.bind("<<ComboboxSelected>>", lambda _: self._save_config())
 
         # Processor selector
         tk.Label(ctrl, text="Processor:", bg=BG, fg=FG).grid(
-            row=0, column=5, sticky=tk.W
+            row=0, column=4, sticky=tk.W
         )
         self._processor_var = tk.StringVar(value=self._saved_processor)
         self._proc_combo = ttk.Combobox(
             ctrl, textvariable=self._processor_var,
             values=["Auto", "GPU", "CPU"], state="readonly", width=6
         )
-        self._proc_combo.grid(row=0, column=6, padx=(4, 12), sticky=tk.W)
+        self._proc_combo.grid(row=0, column=5, padx=(4, 12), sticky=tk.W)
         self._proc_combo.bind("<<ComboboxSelected>>", lambda _: self._save_config())
 
         # Options dropdown (Timestamps in file + Always on top)
@@ -154,11 +177,15 @@ class App(tk.Tk):
             command=self._save_config
         )
         options_menu.add_checkbutton(
+            label="Language tag in transcript", variable=self._show_lang_tag_var,
+            command=self._save_config
+        )
+        options_menu.add_checkbutton(
             label="Always on top", variable=self._ontop_var,
             command=self._toggle_ontop
         )
         options_btn["menu"] = options_menu
-        options_btn.grid(row=0, column=7, padx=(0, 12), sticky=tk.W)
+        options_btn.grid(row=0, column=6, padx=(0, 12), sticky=tk.W)
 
         # Start / Stop button
         self._toggle_btn = tk.Button(
@@ -166,115 +193,40 @@ class App(tk.Tk):
             font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
             padx=14, pady=4, cursor="hand2", command=self._toggle
         )
-        self._toggle_btn.grid(row=0, column=8, padx=4, sticky=tk.E)
+        self._toggle_btn.grid(row=0, column=7, padx=4, sticky=tk.E)
 
         # Clear button
         clear_btn = tk.Button(
             ctrl, text="Clear", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
             padx=10, pady=4, cursor="hand2", command=self._clear_text
         )
-        clear_btn.grid(row=0, column=9, padx=(0, 4), sticky=tk.E)
+        clear_btn.grid(row=0, column=8, padx=(0, 4), sticky=tk.E)
 
         # Meter toggle button
         self._meter_btn = tk.Button(
             ctrl, text="◎ Meter", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
             padx=8, pady=4, cursor="hand2", command=self._toggle_meter
         )
-        self._meter_btn.grid(row=0, column=10, padx=(0, 4), sticky=tk.E)
+        self._meter_btn.grid(row=0, column=9, padx=(0, 4), sticky=tk.E)
 
-        # ── content area: transcript + optional meter panel ───────────────────
+        # ── content area: transcript pane(s) + optional meter panel ─────────
         self._content_frame = tk.Frame(self, bg=BG)
         self._content_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Wrap the transcript in a relative frame so we can overlay a clear button
-        text_frame = tk.Frame(self._content_frame, bg=BG)
-        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Transcript container — rebuilt by _rebuild_transcript_panes()
+        self._transcript_container = tk.Frame(self._content_frame, bg=BG)
+        self._transcript_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._text = scrolledtext.ScrolledText(
-            text_frame, bg=TEXT_BG, fg=FG, font=("Segoe UI", 13),
-            wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
-            padx=12, pady=10, insertbackground=FG
-        )
-        self._text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
-
-        # Small floating clear button anchored to bottom-right of the transcript
-        tk.Button(
-            text_frame, text="✕ clear", bg="#2a2a3e", fg="#585b70",
-            font=("Segoe UI", 8), relief=tk.FLAT, padx=6, pady=2,
-            cursor="hand2", command=self._clear_text,
-            activebackground="#313244", activeforeground=FG,
-        ).place(relx=1.0, rely=1.0, x=-18, y=-8, anchor="se")
-
-        # Tag for timestamp colour
-        self._text.tag_configure("ts", foreground=ACCENT, font=("Segoe UI", 10))
-        self._text.tag_configure("txt", foreground=FG, font=("Segoe UI", 13))
+        self._text = None       # S1 ScrolledText (always present when running)
+        self._text_s2 = None    # S2 ScrolledText (present only when S2 active)
+        self._rebuild_transcript_panes()
 
         # ── audio level meter panel (right side, toggled) ─────────────────────
-        self._meter_panel = tk.Frame(self._content_frame, bg="#13131e", width=130)
+        # Outer container — width adjusts via _rebuild_meter_panel()
+        self._meter_panel = tk.Frame(self._content_frame, bg="#13131e")
         self._meter_panel.pack_propagate(False)
-        # not packed yet — shown/hidden by _toggle_meter()
-
-        tk.Label(self._meter_panel, text="LEVEL METER", bg="#13131e", fg=ACCENT,
-                 font=("Segoe UI", 8, "bold"), pady=4).pack()
-
-        self._meter_canvas = tk.Canvas(
-            self._meter_panel, bg="#0d0d1a", highlightthickness=0, width=110, height=180
-        )
-        self._meter_canvas.pack(padx=8, pady=(0, 4))
-
-        self._meter_rms_var = tk.StringVar(value="RMS: 0.000")
-        tk.Label(self._meter_panel, textvariable=self._meter_rms_var,
-                 bg="#13131e", fg=FG, font=("Segoe UI", 8)).pack()
-
-        tk.Frame(self._meter_panel, bg="#313244", height=1).pack(fill=tk.X, padx=8, pady=6)
-        tk.Label(self._meter_panel, text="SENSITIVITY", bg="#13131e", fg=ACCENT,
-                 font=("Segoe UI", 8, "bold")).pack()
-        tk.Label(self._meter_panel, text="▲ more", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
-
-        tk.Scale(
-            self._meter_panel,
-            variable=self._threshold_var,
-            from_=0.001, to=0.080,
-            resolution=0.001,
-            orient=tk.VERTICAL,
-            bg="#13131e", fg=FG, troughcolor=ENTRY_BG,
-            highlightthickness=0,
-            command=self._on_threshold_change,
-            length=100,
-            showvalue=False,
-        ).pack(pady=2)
-
-        tk.Label(self._meter_panel, text="▼ less", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
-        tk.Label(self._meter_panel, textvariable=self._threshold_display_var,
-                 bg="#13131e", fg="#89b4fa", font=("Segoe UI", 9, "bold")).pack()
-        tk.Label(self._meter_panel, text="threshold", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
-
-        tk.Frame(self._meter_panel, bg="#313244", height=1).pack(fill=tk.X, padx=8, pady=6)
-        tk.Label(self._meter_panel, text="PAUSE GATE", bg="#13131e", fg=ACCENT,
-                 font=("Segoe UI", 8, "bold")).pack()
-        tk.Label(self._meter_panel, text="longer ▲", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
-        tk.Scale(
-            self._meter_panel,
-            variable=self._silence_var,
-            from_=600, to=50,
-            resolution=50,
-            orient=tk.VERTICAL,
-            bg="#13131e", fg=FG, troughcolor=ENTRY_BG,
-            highlightthickness=0,
-            command=self._on_silence_change,
-            length=80,
-            showvalue=False,
-        ).pack(pady=2)
-        tk.Label(self._meter_panel, text="shorter ▼", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
-        tk.Label(self._meter_panel, textvariable=self._silence_display_var,
-                 bg="#13131e", fg="#89b4fa", font=("Segoe UI", 9, "bold")).pack()
-        tk.Label(self._meter_panel, text="end-silence", bg="#13131e", fg="#6c7086",
-                 font=("Segoe UI", 7)).pack()
+        # not packed yet — shown/hidden by _toggle_meter() / _rebuild_meter_panel()
+        self._rebuild_meter_panel()
 
         # ── status bar ────────────────────────────────────────────────────────
         status_frame = tk.Frame(self, bg=ENTRY_BG)
@@ -342,58 +294,243 @@ class App(tk.Tk):
 
     # ── control helpers ───────────────────────────────────────────────────────
 
+    def _make_text_pane(self, parent: tk.Frame, label: str) -> scrolledtext.ScrolledText:
+        """Create a labeled transcript pane inside *parent*. Returns the ScrolledText."""
+        tk.Label(parent, text=label, bg=BG, fg=ACCENT,
+                 font=("Segoe UI", 9, "bold"), pady=3).pack(fill=tk.X, padx=8)
+        st = scrolledtext.ScrolledText(
+            parent, bg=TEXT_BG, fg=FG, font=("Segoe UI", 13),
+            wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
+            padx=12, pady=10, insertbackground=FG
+        )
+        st.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        st.tag_configure("ts", foreground=ACCENT, font=("Segoe UI", 10))
+        st.tag_configure("lang", foreground="#f9e2af", font=("Segoe UI", 10))
+        st.tag_configure("txt", foreground=FG, font=("Segoe UI", 13))
+        tk.Button(
+            parent, text="✕ clear", bg="#2a2a3e", fg="#585b70",
+            font=("Segoe UI", 8), relief=tk.FLAT, padx=6, pady=2,
+            cursor="hand2", command=lambda w=st: self._clear_pane(w),
+            activebackground="#313244", activeforeground=FG,
+        ).place(in_=st, relx=1.0, rely=1.0, x=-18, y=-8, anchor="se")
+        return st
+
+    def _clear_pane(self, widget: scrolledtext.ScrolledText):
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.config(state=tk.DISABLED)
+
+    def _rebuild_transcript_panes(self):
+        """Destroy and recreate transcript pane(s) based on whether S2 is active."""
+        for child in self._transcript_container.winfo_children():
+            child.destroy()
+        self._text = None
+        self._text_s2 = None
+
+        s2_active = bool(self._s2_device)
+        s1_name = self._s1_device or "Source 1"
+        s2_name = self._s2_device or "Source 2"
+
+        if s2_active:
+            f1 = tk.Frame(self._transcript_container, bg=BG)
+            f1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Frame(self._transcript_container, bg="#45475a", width=2).pack(
+                side=tk.LEFT, fill=tk.Y, pady=4)
+            f2 = tk.Frame(self._transcript_container, bg=BG)
+            f2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self._text = self._make_text_pane(f1, f"Source 1 — {s1_name}")
+            self._text_s2 = self._make_text_pane(f2, f"Source 2 — {s2_name}")
+        else:
+            f1 = tk.Frame(self._transcript_container, bg=BG)
+            f1.pack(fill=tk.BOTH, expand=True)
+            self._text = self._make_text_pane(f1, f"Source 1 — {s1_name}")
+
+    def _build_single_meter_col(self, parent: tk.Frame,
+                                 thresh_var: tk.DoubleVar,
+                                 thresh_disp: tk.StringVar,
+                                 silence_var: tk.IntVar,
+                                 silence_disp: tk.StringVar,
+                                 rms_var: tk.StringVar,
+                                 canvas_attr: str,
+                                 thresh_cmd,
+                                 silence_cmd,
+                                 label: str):
+        """Build one meter column inside *parent*. Stores canvas in self.<canvas_attr>."""
+        tk.Label(parent, text=label, bg="#13131e", fg=ACCENT,
+                 font=("Segoe UI", 8, "bold"), pady=4).pack()
+        canvas = tk.Canvas(
+            parent, bg="#0d0d1a", highlightthickness=0, width=90, height=180
+        )
+        canvas.pack(padx=4, pady=(0, 4))
+        setattr(self, canvas_attr, canvas)
+
+        tk.Label(parent, textvariable=rms_var, bg="#13131e", fg=FG,
+                 font=("Segoe UI", 8)).pack()
+        tk.Frame(parent, bg="#313244", height=1).pack(fill=tk.X, padx=4, pady=4)
+        tk.Label(parent, text="SENSITIVITY", bg="#13131e", fg=ACCENT,
+                 font=("Segoe UI", 8, "bold")).pack()
+        tk.Label(parent, text="▲ more", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+        tk.Scale(parent, variable=thresh_var, from_=0.001, to=0.080,
+                 resolution=0.001, orient=tk.VERTICAL, bg="#13131e", fg=FG,
+                 troughcolor=ENTRY_BG, highlightthickness=0,
+                 command=thresh_cmd, length=90, showvalue=False).pack(pady=2)
+        tk.Label(parent, text="▼ less", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+        tk.Label(parent, textvariable=thresh_disp, bg="#13131e", fg="#89b4fa",
+                 font=("Segoe UI", 9, "bold")).pack()
+        tk.Label(parent, text="threshold", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+        tk.Frame(parent, bg="#313244", height=1).pack(fill=tk.X, padx=4, pady=4)
+        tk.Label(parent, text="PAUSE GATE", bg="#13131e", fg=ACCENT,
+                 font=("Segoe UI", 8, "bold")).pack()
+        tk.Label(parent, text="longer ▲", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+        tk.Scale(parent, variable=silence_var, from_=600, to=50,
+                 resolution=50, orient=tk.VERTICAL, bg="#13131e", fg=FG,
+                 troughcolor=ENTRY_BG, highlightthickness=0,
+                 command=silence_cmd, length=70, showvalue=False).pack(pady=2)
+        tk.Label(parent, text="shorter ▼", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+        tk.Label(parent, textvariable=silence_disp, bg="#13131e", fg="#89b4fa",
+                 font=("Segoe UI", 9, "bold")).pack()
+        tk.Label(parent, text="end-silence", bg="#13131e", fg="#6c7086",
+                 font=("Segoe UI", 7)).pack()
+
+    def _rebuild_meter_panel(self):
+        """Destroy and recreate meter column(s) based on whether S2 is active."""
+        for child in self._meter_panel.winfo_children():
+            child.destroy()
+        self._meter_canvas = None
+        self._meter_canvas_s2 = None
+        self._meter_rms_var = tk.StringVar(value="RMS: 0.000")
+        self._meter_rms_s2_var = tk.StringVar(value="RMS: 0.000")
+
+        s2_active = bool(self._s2_device)
+        panel_width = 250 if s2_active else 130
+        self._meter_panel.config(width=panel_width)
+
+        if s2_active:
+            col1 = tk.Frame(self._meter_panel, bg="#13131e")
+            col1.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+            tk.Frame(self._meter_panel, bg="#313244", width=1).pack(
+                side=tk.LEFT, fill=tk.Y, pady=4)
+            col2 = tk.Frame(self._meter_panel, bg="#13131e")
+            col2.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+            self._build_single_meter_col(
+                col1, self._threshold_var, self._threshold_display_var,
+                self._silence_var, self._silence_display_var,
+                self._meter_rms_var, "_meter_canvas",
+                self._on_threshold_change, self._on_silence_change, "S1 LEVEL"
+            )
+            self._build_single_meter_col(
+                col2, self._s2_threshold_var, self._s2_threshold_display_var,
+                self._s2_silence_var, self._s2_silence_display_var,
+                self._meter_rms_s2_var, "_meter_canvas_s2",
+                self._on_s2_threshold_change, self._on_s2_silence_change, "S2 LEVEL"
+            )
+        else:
+            col1 = tk.Frame(self._meter_panel, bg="#13131e")
+            col1.pack(fill=tk.BOTH, expand=True)
+            self._build_single_meter_col(
+                col1, self._threshold_var, self._threshold_display_var,
+                self._silence_var, self._silence_display_var,
+                self._meter_rms_var, "_meter_canvas",
+                self._on_threshold_change, self._on_silence_change, "LEVEL METER"
+            )
+
     def _refresh_devices(self):
         devices = list_loopback_devices()
-        if not devices:
-            devices = ["(no loopback devices found)"]
-            self._device_combo["values"] = devices
-            self._device_combo.current(0)
-            return
+        self._all_devices = devices if devices else []
 
-        self._device_combo["values"] = devices
+        # Determine S1 default if none saved
+        if not self._s1_device and devices:
+            default_name = get_default_output_name()
+            if default_name:
+                for name in devices:
+                    if default_name.lower() in name.lower() or name.lower() in default_name.lower():
+                        self._s1_device = name
+                        break
+            if not self._s1_device:
+                self._s1_device = devices[0]
 
-        # 1. Try to restore the saved device name.
-        saved = getattr(self, "_saved_device", None)
-        if saved:
-            for i, name in enumerate(devices):
-                if name == saved:
-                    self._device_combo.current(i)
-                    log.debug("Restored saved device index %d: %r", i, name)
-                    return
+        self._rebuild_sources_menu()
 
-        # 2. Fall back to matching the Windows default output device.
-        default_name = get_default_output_name()
-        if default_name:
-            for i, name in enumerate(devices):
-                if default_name.lower() in name.lower() or name.lower() in default_name.lower():
-                    self._device_combo.current(i)
-                    log.debug("Pre-selected default device index %d: %r", i, name)
-                    return
+    def _rebuild_sources_menu(self):
+        """Rebuild the Sources dropdown reflecting current S1/S2 selections."""
+        menu = self._sources_menu
+        menu.delete(0, "end")
+        devices = getattr(self, "_all_devices", [])
 
-        # 3. Fall back to first entry.
-        self._device_combo.current(0)
+        menu.add_command(label="── Source 1 ──", state="disabled")
+        for name in devices:
+            if name == self._s2_device:
+                menu.add_command(label=f"  {name}  (Already Source 2)",
+                                 foreground="#6c7086",
+                                 command=lambda n=name: self._select_source(1, n))
+            elif name == self._s1_device:
+                menu.add_command(label=f"✓ {name}",
+                                 command=lambda n=name: self._select_source(1, n))
+            else:
+                menu.add_command(label=f"  {name}",
+                                 command=lambda n=name: self._select_source(1, n))
+
+        menu.add_separator()
+        menu.add_command(label="── Source 2 ──", state="disabled")
+        menu.add_command(
+            label="✓ (disabled)" if not self._s2_device else "  (disabled)",
+            command=lambda: self._select_source(2, None)
+        )
+        for name in devices:
+            if name == self._s1_device:
+                menu.add_command(label=f"  {name}  (Already Source 1)",
+                                 foreground="#6c7086",
+                                 command=lambda n=name: self._select_source(2, n))
+            elif name == self._s2_device:
+                menu.add_command(label=f"✓ {name}",
+                                 command=lambda n=name: self._select_source(2, n))
+            else:
+                menu.add_command(label=f"  {name}",
+                                 command=lambda n=name: self._select_source(2, n))
+
+    def _select_source(self, source_num: int, device_name: str | None):
+        """Called when user picks a device for Source 1 or 2."""
+        if source_num == 1:
+            if device_name and device_name == self._s1_device:
+                return  # S1 can't be disabled
+            self._s1_device = device_name
+        else:
+            # Toggle off if already selected
+            if device_name == self._s2_device:
+                self._s2_device = None
+            else:
+                self._s2_device = device_name
+
+        self._save_config()
+        self._rebuild_sources_menu()
+        self._rebuild_transcript_panes()
+        self._rebuild_meter_panel()
+
+        if self._running:
+            self._restart_capture_all()
 
     def _on_device_selected(self, _event=None):
         self._save_config()
         if self._running:
-            self._restart_capture()
+            self._restart_capture_all()
 
-    def _restart_capture(self):
-        """Stop the current capture thread and start a new one with the selected device.
-        The transcriber thread keeps running — no model reload needed.
-        """
-        device_name = self._device_var.get()
-        if not device_name or "(no loopback" in device_name:
+    def _restart_capture_all(self):
+        """Stop all capture threads and restart with current S1/S2 settings."""
+        if not self._s1_device:
             return
-        log.info("Device changed — restarting capture on %r", device_name)
-        self._set_status(f"Switching to {device_name}…")
+        log.info("Restarting capture — S1=%r S2=%r", self._s1_device, self._s2_device)
+        self._set_status(f"Switching sources…")
 
-        # Stop old capture thread only
         if self._capture_thread:
             self._capture_thread.stop()
-            # Don't join — daemon thread will die on its own; stop() signals it promptly
+        if self._capture_thread_s2:
+            self._capture_thread_s2.stop()
 
-        # Drain any stale audio buffered from the old device
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()
@@ -402,14 +539,28 @@ class App(tk.Tk):
 
         self._capture_thread = AudioCaptureThread(
             audio_queue=self._audio_queue,
-            device_name=device_name,
+            device_name=self._s1_device,
             speech_threshold=self._threshold_var.get(),
             end_silence_ms=self._silence_var.get(),
             on_level=self._on_level_callback,
+            source_id=1,
         )
         self._capture_thread.start()
         self._meter_peak = 0.0
-        log.info("Capture restarted on %r", device_name)
+
+        if self._s2_device:
+            self._capture_thread_s2 = AudioCaptureThread(
+                audio_queue=self._audio_queue,
+                device_name=self._s2_device,
+                speech_threshold=self._s2_threshold_var.get(),
+                end_silence_ms=self._s2_silence_var.get(),
+                on_level=self._on_s2_level_callback,
+                source_id=2,
+            )
+            self._capture_thread_s2.start()
+            self._s2_meter_peak = 0.0
+        else:
+            self._capture_thread_s2 = None
 
     def _toggle_ontop(self):
         self.attributes("-topmost", self._ontop_var.get())
@@ -441,16 +592,15 @@ class App(tk.Tk):
         if self._transcriber_thread is not None:
             self._transcriber_thread.join(timeout=1.0)
 
-        device_name = self._device_var.get()
+        device_name = self._s1_device
         open_session_log()
-        log.info("Start requested — device=%r model=%r", device_name, self._model_var.get())
-        if not device_name or "(no loopback" in device_name:
-            log.error("No loopback device selected — cannot start")
+        log.info("Start requested — S1=%r S2=%r model=%r", device_name, self._s2_device, self._model_var.get())
+        if not device_name:
+            log.error("No S1 device selected — cannot start")
             messagebox.showerror(
                 "No device",
-                "No loopback audio device found.\n\n"
-                "Enable 'Stereo Mix' in Windows Sound settings or install a "
-                "virtual audio cable (e.g. VB-Audio Virtual Cable)."
+                "No Source 1 audio device selected.\n\n"
+                "Click Sources \u25be to select an audio device."
             )
             return
 
@@ -464,7 +614,18 @@ class App(tk.Tk):
             speech_threshold=self._threshold_var.get(),
             end_silence_ms=self._silence_var.get(),
             on_level=self._on_level_callback,
+            source_id=1,
         )
+        self._capture_thread_s2 = None
+        if self._s2_device:
+            self._capture_thread_s2 = AudioCaptureThread(
+                audio_queue=self._audio_queue,
+                device_name=self._s2_device,
+                speech_threshold=self._s2_threshold_var.get(),
+                end_silence_ms=self._s2_silence_var.get(),
+                on_level=self._on_s2_level_callback,
+                source_id=2,
+            )
         self._transcriber_thread = TranscriberThread(
             audio_queue=self._audio_queue,
             on_result=self._on_result,
@@ -476,6 +637,8 @@ class App(tk.Tk):
         )
 
         self._capture_thread.start()
+        if self._capture_thread_s2:
+            self._capture_thread_s2.start()
         self._transcriber_thread.start()
 
         self._running = True
@@ -492,6 +655,9 @@ class App(tk.Tk):
             self._transcriber_thread.stop()
         if self._capture_thread:
             self._capture_thread.stop()
+        if self._capture_thread_s2:
+            self._capture_thread_s2.stop()
+        self._capture_thread_s2 = None
         self._running = False
         self._device_info = None
         self._queue_var.set("")
@@ -505,9 +671,9 @@ class App(tk.Tk):
         close_session_log()
 
     def _clear_text(self):
-        self._text.config(state=tk.NORMAL)
-        self._text.delete("1.0", tk.END)
-        self._text.config(state=tk.DISABLED)
+        self._clear_pane(self._text)
+        if self._text_s2:
+            self._clear_pane(self._text_s2)
 
     # ── queue depth polling ───────────────────────────────────────────────────
 
@@ -572,9 +738,9 @@ class App(tk.Tk):
 
     # ── thread-safe callbacks (called from background threads) ────────────────
 
-    def _on_result(self, timestamp: str, text: str):
+    def _on_result(self, timestamp: str, text: str, language: str, source_id: int = 1):
         """Called from TranscriberThread — must post to main thread via after()."""
-        self.after(0, self._append_result, timestamp, text)
+        self.after(0, self._append_result, timestamp, text, language, source_id)
 
     def _on_error(self, message: str):
         self.after(0, self._show_error, message)
@@ -587,24 +753,38 @@ class App(tk.Tk):
 
     # ── main-thread UI updates ────────────────────────────────────────────────
 
-    def _append_result(self, timestamp: str, text: str):
-        self._text.config(state=tk.NORMAL)
-        self._text.insert(tk.END, f"[{timestamp}] ", "ts")
-        self._text.insert(tk.END, f"{text}\n", "txt")
-        self._text.see(tk.END)
-        self._text.config(state=tk.DISABLED)
-        if self._ts_in_output_var.get():
-            self._output_lines.append(f"[{timestamp}] {text}")
-        else:
-            self._output_lines.append(text)
-        self._write_output_file()
+    def _append_result(self, timestamp: str, text: str, language: str, source_id: int = 1):
+        widget = self._text if (source_id == 1 or self._text_s2 is None) else self._text_s2
+        widget.config(state=tk.NORMAL)
+        widget.insert(tk.END, f"[{timestamp}] ", "ts")
+        if self._show_lang_tag_var.get():
+            widget.insert(tk.END, f"[{language}] ", "lang")
+        widget.insert(tk.END, f"{text}\n", "txt")
+        widget.see(tk.END)
+        widget.config(state=tk.DISABLED)
 
-    def _write_output_file(self):
+        lang_prefix = f"[{language}] " if self._show_lang_tag_var.get() else ""
+        line = f"{lang_prefix}{text}"
+        ts_line = f"[{timestamp}] {line}" if self._ts_in_output_var.get() else line
+        src_tag = "{S1}" if source_id == 1 else "{S2}"
+
+        if source_id == 1:
+            self._output_lines.append(ts_line)
+            self._write_source_file(self._output_file, self._output_lines)
+        else:
+            self._s2_output_lines.append(ts_line)
+            self._write_source_file(self._s2_output_file, self._s2_output_lines)
+
+        combined_line = f"{src_tag} {ts_line}"
+        self._combined_output_lines.append(combined_line)
+        self._write_source_file(self._combined_output_file, self._combined_output_lines)
+
+    def _write_source_file(self, path: str, lines):
         try:
-            with open(self._output_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(self._output_lines))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
         except OSError as exc:
-            log.warning("Could not write output.txt: %s", exc)
+            log.warning("Could not write %s: %s", path, exc)
 
     def _show_error(self, message: str):
         log.error("Application error: %s", message)
@@ -639,8 +819,65 @@ class App(tk.Tk):
             self._meter_btn.config(bg=ENTRY_BG, fg=FG)
 
     def _on_level_callback(self, rms: float):
-        """Called from AudioCaptureThread — uses after() for thread safety."""
+        """Called from AudioCaptureThread S1 — uses after() for thread safety."""
         self.after(0, self._update_meter, rms)
+
+    def _on_s2_level_callback(self, rms: float):
+        """Called from AudioCaptureThread S2 — uses after() for thread safety."""
+        self.after(0, self._update_meter_s2, rms)
+
+    def _on_s2_threshold_change(self, val):
+        self._s2_threshold_display_var.set(f"{float(val):.3f}")
+        if self._capture_thread_s2 and self._running:
+            self._capture_thread_s2.speech_threshold = float(val)
+        self._save_config()
+
+    def _on_s2_silence_change(self, val):
+        ms = int(float(val))
+        self._s2_silence_display_var.set(f"{ms} ms")
+        if self._capture_thread_s2 and self._running:
+            self._capture_thread_s2.end_silence_ms = ms
+        self._save_config()
+
+    def _update_meter_s2(self, rms: float):
+        if not hasattr(self, "_meter_rms_s2_var"):
+            return
+        self._meter_rms_s2_var.set(f"RMS: {rms:.4f}")
+        if not self._meter_visible:
+            return
+        c = getattr(self, "_meter_canvas_s2", None)
+        if c is None:
+            return
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 2 or h < 2:
+            return
+        MAX_RMS = 0.08
+        frac = min(rms / MAX_RMS, 1.0)
+        thresh = self._s2_threshold_var.get()
+        thresh_frac = min(thresh / MAX_RMS, 1.0)
+        bar_top = int((1.0 - frac) * h)
+        thresh_y = int((1.0 - thresh_frac) * h)
+        if rms > self._s2_meter_peak:
+            self._s2_meter_peak = rms
+        else:
+            self._s2_meter_peak = max(0.0, self._s2_meter_peak - 0.0015)
+        peak_y = max(0, int((1.0 - min(self._s2_meter_peak / MAX_RMS, 1.0)) * h))
+        if rms < thresh:
+            color = "#45475a"
+        elif rms < thresh * 2.5:
+            color = "#a6e3a1"
+        elif rms < thresh * 6:
+            color = "#f9e2af"
+        else:
+            color = "#f38ba8"
+        c.delete("all")
+        c.create_rectangle(0, 0, w, h, fill="#0d0d1a", outline="")
+        if bar_top < h:
+            c.create_rectangle(6, bar_top, w - 6, h, fill=color, outline="")
+        if 0 <= peak_y < h:
+            c.create_line(6, peak_y, w - 6, peak_y, fill=color, width=2)
+        c.create_line(0, thresh_y, w, thresh_y, fill="#89b4fa", width=2, dash=(5, 3))
 
     def _update_meter(self, rms: float):
         self._meter_rms_var.set(f"RMS: {rms:.4f}")
@@ -715,8 +952,12 @@ class App(tk.Tk):
             data["end_silence_ms"] = self._silence_var.get()
             data["model"] = self._model_var.get()
             data["processor"] = self._processor_var.get()
-            data["device"] = self._device_var.get()
+            data["s1_device"] = self._s1_device
+            data["s2_device"] = self._s2_device
+            data["s2_threshold"] = round(self._s2_threshold_var.get(), 4)
+            data["s2_end_silence_ms"] = self._s2_silence_var.get()
             data["ts_in_output"] = self._ts_in_output_var.get()
+            data["show_lang_tag"] = self._show_lang_tag_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:

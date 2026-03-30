@@ -128,7 +128,7 @@ class TranscriberThread(threading.Thread):
     def __init__(
         self,
         audio_queue: queue.Queue,
-        on_result: Callable[[str, str], None],
+        on_result: Callable[[str, str, str, int], None],
         on_error: Callable[[str], None],
         on_status: Callable[[str], None],
         on_device_info: Callable[[str, str], None] | None = None,
@@ -148,7 +148,7 @@ class TranscriberThread(threading.Thread):
     def stop(self):
         self._stop_event.set()
         # Unblock the queue.get() call
-        self.audio_queue.put(("stop", None))
+        self.audio_queue.put(("stop", None, 0))
 
     def run(self):
         log.info("TranscriberThread starting (model=%s)", self.model_size)
@@ -259,9 +259,13 @@ class TranscriberThread(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
-                tag, payload = self.audio_queue.get(timeout=0.5)
+                item = self.audio_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+
+            tag = item[0]
+            payload = item[1]
+            source_id = item[2] if len(item) > 2 else 1
 
             if tag == "stop":
                 break
@@ -273,18 +277,19 @@ class TranscriberThread(threading.Thread):
                 continue
             if tag != "audio":
                 continue
-
-            # ── queue cap: drain and drop stale backlog ───────────────────────
             # Drain everything waiting behind the utterance we just pulled.
             # If more than MAX_QUEUED_UTTERANCES are waiting (queue backed up
             # while GPU was busy with game), discard the oldest so we don't
             # translate a pile of stale audio and cause a second GPU spike.
-            queued_audio: list = []
+            queued_audio: list = []  # list of (audio_data, source_id)
             while True:
                 try:
-                    next_tag, next_payload = self.audio_queue.get_nowait()
+                    next_item = self.audio_queue.get_nowait()
                 except queue.Empty:
                     break
+                next_tag = next_item[0]
+                next_payload = next_item[1]
+                next_src = next_item[2] if len(next_item) > 2 else 1
                 if next_tag == "stop":
                     self._stop_event.set()
                     break
@@ -292,7 +297,7 @@ class TranscriberThread(threading.Thread):
                     self.on_error(next_payload)
                     break
                 if next_tag == "audio":
-                    queued_audio.append(next_payload)
+                    queued_audio.append((next_payload, next_src))
                 # status tags discarded (stale by now)
 
             if len(queued_audio) > MAX_QUEUED_UTTERANCES:
@@ -301,131 +306,130 @@ class TranscriberThread(threading.Thread):
                 self.on_status(f"Dropped {dropped} stale utterance(s) to keep up…")
                 queued_audio = queued_audio[-MAX_QUEUED_UTTERANCES:]
 
-            audio_parts = [payload] + queued_audio
+            # audio_parts is list of (audio_data, source_id)
+            # Only batch items from the same source to avoid cross-source merging.
+            audio_parts = [(payload, source_id)] + queued_audio
             seq_start = utterance_seq + 1
             utterance_seq += len(audio_parts)
             seq_end = utterance_seq
             seq_label = f"#{seq_start}" if seq_start == seq_end else f"#{seq_start}–{seq_end}"
             batch_count = len(audio_parts)
 
-            # Join parts with short silence gaps between them
-            if batch_count == 1:
-                audio_data = audio_parts[0]
-            else:
-                interleaved = []
-                for i, part in enumerate(audio_parts):
-                    interleaved.append(part)
-                    if i < len(audio_parts) - 1:
-                        interleaved.append(SILENCE_GAP)
-                audio_data = np.concatenate(interleaved)
-
-            duration = len(audio_data) / SAMPLE_RATE
-            try:
-                if batch_count > 1:
-                    log.info(
-                        "Batch transcribe %s (%d utterances, %.2f s total)",
-                        seq_label, batch_count, duration
-                    )
-                    self.on_status(
-                        f"Translating {seq_label} "
-                        f"({batch_count} utterances batched, {duration:.1f}s)…"
-                    )
+            # Group consecutive same-source items; process each group separately.
+            groups: list[tuple[int, list]] = []  # (source_id, [audio_arrays])
+            for aud, src in audio_parts:
+                if groups and groups[-1][0] == src:
+                    groups[-1][1].append(aud)
                 else:
-                    log.debug("Transcribing utterance %s (%.2f s)", seq_label, duration)
+                    groups.append((src, [aud]))
+
+            for grp_src, grp_parts in groups:
+                if len(grp_parts) == 1:
+                    audio_data = grp_parts[0]
+                else:
+                    interleaved = []
+                    for i, part in enumerate(grp_parts):
+                        interleaved.append(part)
+                        if i < len(grp_parts) - 1:
+                            interleaved.append(SILENCE_GAP)
+                    audio_data = np.concatenate(interleaved)
+
+                duration = len(audio_data) / SAMPLE_RATE
+                try:
+                    log.debug("Transcribing %s src=%d (%.2f s)", seq_label, grp_src, duration)
                     self.on_status(f"Translating {seq_label} ({duration:.1f}s)…")
 
-                segments, info = model.transcribe(
-                    audio_data,
-                    language="ru",
-                    task="translate",       # outputs English directly
-                    beam_size=1,            # greedy decode — no beam search overhead
-                    temperature=0.0,        # single pass only; disables the fallback
-                                            # retry loop (0.0→0.2→0.4→0.6→0.8→1.0)
-                                            # that was doing 6× the GPU work per utterance
-                    log_prob_threshold=None,        # don't trigger temperature fallback
-                    no_speech_threshold=0.6,        # skip silent/noise segments fast
-                    condition_on_previous_text=False,  # no prompt carry-over overhead
-                    without_timestamps=True,           # skip timestamp decode pass
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 300},
-                )
-                log.debug(
-                    "%s — language=%s (prob=%.2f)",
-                    seq_label, info.language, info.language_probability
-                )
-                for segment in segments:
-                    text = segment.text.strip()
-                    if text:
-                        ts = time.strftime("%H:%M:%S")
-                        log.info("[%s] %s %s", ts, seq_label, text)
-                        self.on_result(ts, text)
-                # Never break out of the segment generator mid-inference.
-                # Interrupting the lazy ctranslate2 generator leaves its
-                # internal C++ decoder state allocated; when the model is
-                # later GC'd the destructor crashes with std::terminate()
-                # (exception code 0xc0000409 in ucrtbase.dll).  Instead we
-                # let the current utterance finish, then the outer while
-                # loop's stop-event check exits cleanly.
-                self.on_status("Listening…")
-                # Yield GPU time back to foreground apps between inferences.
-                # 150 ms is imperceptible as translation latency but gives the
-                # OS GPU scheduler a window to service the game.
-                time.sleep(0.15)
-            except Exception as exc:  # noqa: BLE001
-                err_str = str(exc).lower()
-                # mkl_malloc failure = Intel MKL can't get RAM — happens when the
-                # game's loading screen temporarily consumes most system RAM.
-                # Transient: wait for loading to finish, skip utterance, continue.
-                ram_pressure = "mkl_malloc" in err_str or "mkl-service" in err_str
-                cuda_failure = device == "cuda" and not ram_pressure and (
-                    "dll" in err_str
-                    or "library" in err_str
-                    or "out of memory" in err_str
-                    or "bad allocation" in err_str
-                    or isinstance(exc, MemoryError)
-                )
-                if ram_pressure:
-                    log.warning("RAM pressure on %s (%s) — waiting 2 s then retrying", seq_label, exc)
-                    self.on_status("Low RAM (game loading?) — pausing, will retry…")
-                    time.sleep(2.0)  # wait for loading screen to release RAM
-                    # Re-queue the utterance so it gets translated once RAM frees up.
-                    # The audio data itself is safe — it lives in Python's heap, not
-                    # MKL's allocation arena.  Only MKL's internal scratchpad failed.
-                    self.audio_queue.put(("audio", audio_data))
+                    segments, info = model.transcribe(
+                        audio_data,
+                        task="translate",       # outputs English directly
+                        beam_size=1,            # greedy decode — no beam search overhead
+                        temperature=0.0,        # single pass only; disables the fallback
+                                                # retry loop (0.0→0.2→0.4→0.6→0.8→1.0)
+                                                # that was doing 6× the GPU work per utterance
+                        log_prob_threshold=None,        # don't trigger temperature fallback
+                        no_speech_threshold=0.6,        # skip silent/noise segments fast
+                        condition_on_previous_text=False,  # no prompt carry-over overhead
+                        without_timestamps=True,           # skip timestamp decode pass
+                        vad_filter=True,
+                        vad_parameters={"min_silence_duration_ms": 300},
+                    )
+                    log.debug(
+                        "%s — language=%s (prob=%.2f)",
+                        seq_label, info.language, info.language_probability
+                    )
+                    for segment in segments:
+                        text = segment.text.strip()
+                        if text:
+                            ts = time.strftime("%H:%M:%S")
+                            log.info("[%s] %s %s", ts, seq_label, text)
+                            self.on_result(ts, text, info.language, grp_src)
+                    # Never break out of the segment generator mid-inference.
+                    # Interrupting the lazy ctranslate2 generator leaves its
+                    # internal C++ decoder state allocated; when the model is
+                    # later GC'd the destructor crashes with std::terminate()
+                    # (exception code 0xc0000409 in ucrtbase.dll).  Instead we
+                    # let the current utterance finish, then the outer while
+                    # loop's stop-event check exits cleanly.
                     self.on_status("Listening…")
-                elif cuda_failure:
-                    # GPU ran out of VRAM (game took it all) or CUDA DLL missing.
-                    # Fall back to CPU silently and keep the session running —
-                    # do NOT call on_error() which would stop the app.
-                    log.warning("CUDA failure on %s (%s) — falling back to CPU", seq_label, exc)
-                    self.on_status("VRAM full — switching to CPU and retrying…")
-                    try:
-                        # Free VRAM explicitly before parking. unload_model() releases
-                        # the ctranslate2 GPU allocations without running the crashing
-                        # C++ destructor path.  The empty object is then parked so
-                        # the (now no-op) destructor never runs from the GC either.
+                    # Yield GPU time back to foreground apps between inferences.
+                    # 150 ms is imperceptible as translation latency but gives the
+                    # OS GPU scheduler a window to service the game.
+                    time.sleep(0.15)
+                except Exception as exc:  # noqa: BLE001
+                    err_str = str(exc).lower()
+                    # mkl_malloc failure = Intel MKL can't get RAM — happens when the
+                    # game's loading screen temporarily consumes most system RAM.
+                    # Transient: wait for loading to finish, skip utterance, continue.
+                    ram_pressure = "mkl_malloc" in err_str or "mkl-service" in err_str
+                    cuda_failure = device == "cuda" and not ram_pressure and (
+                        "dll" in err_str
+                        or "library" in err_str
+                        or "out of memory" in err_str
+                        or "bad allocation" in err_str
+                        or isinstance(exc, MemoryError)
+                    )
+                    if ram_pressure:
+                        log.warning("RAM pressure on %s (%s) — waiting 2 s then retrying", seq_label, exc)
+                        self.on_status("Low RAM (game loading?) — pausing, will retry…")
+                        time.sleep(2.0)  # wait for loading screen to release RAM
+                        # Re-queue the utterance so it gets translated once RAM frees up.
+                        # The audio data itself is safe — it lives in Python's heap, not
+                        # MKL's allocation arena.  Only MKL's internal scratchpad failed.
+                        self.audio_queue.put(("audio", audio_data, grp_src))
+                        self.on_status("Listening…")
+                    elif cuda_failure:
+                        # GPU ran out of VRAM (game took it all) or CUDA DLL missing.
+                        # Fall back to CPU silently and keep the session running —
+                        # do NOT call on_error() which would stop the app.
+                        log.warning("CUDA failure on %s (%s) — falling back to CPU", seq_label, exc)
+                        self.on_status("VRAM full — switching to CPU and retrying…")
                         try:
-                            model.model.unload_model(to_cpu=False)
-                            log.debug("CUDA model unloaded from VRAM before CPU fallback")
-                        except Exception:
-                            pass
-                        _RETIRED_MODELS.append(model)  # suppress crashing destructor
-                        model = WhisperModel(
-                            _resolve_model_path(self.model_size), device="cpu", compute_type="int8",
-                            cpu_threads=2, num_workers=1,
-                        )
-                        device = "cpu"
-                        log.warning("Permanently switched to CPU (int8) after CUDA failure")
-                        self.on_device_info("cpu", "int8")
-                        self.on_status("Switched to CPU (VRAM full). Translation continuing…")
-                        # Re-queue this batch so it gets translated on CPU
-                        self.audio_queue.put(("audio", audio_data))
-                    except Exception as cpu_exc:  # noqa: BLE001
-                        log.exception("CPU fallback also failed")
-                        self.on_error(f"Fatal transcription error: {cpu_exc}")
-                else:
-                    log.exception("Transcription error on %s", seq_label)
-                    self.on_error(f"Transcription error: {exc}")
+                            # Free VRAM explicitly before parking. unload_model() releases
+                            # the ctranslate2 GPU allocations without running the crashing
+                            # C++ destructor path.  The empty object is then parked so
+                            # the (now no-op) destructor never runs from the GC either.
+                            try:
+                                model.model.unload_model(to_cpu=False)
+                                log.debug("CUDA model unloaded from VRAM before CPU fallback")
+                            except Exception:
+                                pass
+                            _RETIRED_MODELS.append(model)  # suppress crashing destructor
+                            model = WhisperModel(
+                                _resolve_model_path(self.model_size), device="cpu", compute_type="int8",
+                                cpu_threads=2, num_workers=1,
+                            )
+                            device = "cpu"
+                            log.warning("Permanently switched to CPU (int8) after CUDA failure")
+                            self.on_device_info("cpu", "int8")
+                            self.on_status("Switched to CPU (VRAM full). Translation continuing…")
+                            # Re-queue this batch so it gets translated on CPU
+                            self.audio_queue.put(("audio", audio_data, grp_src))
+                        except Exception as cpu_exc:  # noqa: BLE001
+                            log.exception("CPU fallback also failed")
+                            self.on_error(f"Fatal transcription error: {cpu_exc}")
+                    else:
+                        log.exception("Transcription error on %s", seq_label)
+                        self.on_error(f"Transcription error: {exc}")
 
         # Free VRAM and park the model shell.  unload_model() releases the GPU
         # allocations explicitly, so VRAM is returned immediately on Stop.
