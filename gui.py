@@ -116,11 +116,10 @@ class App(tk.Tk):
         self._file_s2_translate_var  = tk.BooleanVar(value=_cfg.get("file_s2_translate",  False))
         self._file_com_translate_var = tk.BooleanVar(value=_cfg.get("file_com_translate",  False))
         self._view_translate_var     = tk.BooleanVar(value=_cfg.get("view_translate",      False))
-        # Lazily-loaded OPUS-MT translator; loaded in a background thread on first use.
-        self._opus_translator = None
-        self._opus_tokenizer  = None
+        # argostranslate: True once the en→ru language pack is confirmed present.
+        self._translator_ready = False
         self._translator_loading = False
-        # Pre-load if any translate flag was saved as True
+        # Pre-verify if any translate flag was saved as True
         if any(v.get() for v in (
             self._file_s1_translate_var, self._file_s2_translate_var,
             self._file_com_translate_var, self._view_translate_var,
@@ -689,32 +688,27 @@ class App(tk.Tk):
             self._file_s1_translate_var, self._file_s2_translate_var,
             self._file_com_translate_var, self._view_translate_var,
         ))
-        if any_on and self._opus_translator is None and not self._translator_loading:
-            # Check pre-requisites before starting the background load.
-            model_bin = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "models", "opus-mt-en-ru", "model.bin",
-            )
+        if any_on and not self._translator_ready and not self._translator_loading:
+            # Check whether argostranslate + en→ru pack are installed.
             try:
-                import transformers as _tr  # noqa: F401,PLC0415
-                import sentencepiece as _sp  # noqa: F401,PLC0415
-                packages_ok = True
+                from argostranslate import package as _pkg  # noqa: PLC0415
+                installed = _pkg.get_installed_packages()
+                pkg_ok = any(p.from_code == "en" and p.to_code == "ru" for p in installed)
             except ImportError:
-                packages_ok = False
+                pkg_ok = False
 
-            if not packages_ok or not os.path.isfile(model_bin):
-                # Revert all translate flags so the checkbuttons aren't left
-                # ticked in an unusable state.
+            if not pkg_ok:
                 for v in (self._file_s1_translate_var, self._file_s2_translate_var,
                           self._file_com_translate_var, self._view_translate_var):
                     v.set(False)
                 messagebox.showinfo(
-                    "Translation model not ready",
-                    "The offline translation model has not been downloaded yet.\n\n"
+                    "Translation package not ready",
+                    "The offline English→Russian translation package has not been "
+                    "downloaded yet.\n\n"
                     "Run this command once in a terminal, then restart the app:\n\n"
                     "    python download_translation_model.py\n\n"
-                    "This downloads ~80 MB and installs the required packages.\n"
-                    "After that, the translate toggles will work."
+                    "This installs argostranslate and downloads the ~80 MB language "
+                    "pack.\nAfter that, the translate toggles will work fully offline."
                 )
                 self._save_repost()
                 return
@@ -724,19 +718,19 @@ class App(tk.Tk):
         self._save_repost()
 
     def _load_translator_bg(self):
-        """Background thread: lazily load OPUS-MT translator + tokenizer once."""
+        """Background thread: verify argostranslate en→ru pack is ready."""
         try:
-            from transcriber import _load_opus_translator  # noqa: PLC0415
-            translator, tokenizer = _load_opus_translator(
-                lambda msg: self.after(0, self._set_status, msg)
-            )
-            self._opus_translator = translator
-            self._opus_tokenizer  = tokenizer
-            if translator is None:
-                # Load failed — revert all translate flags so user isn't confused
+            from argostranslate import package as _pkg  # noqa: PLC0415
+            installed = _pkg.get_installed_packages()
+            if any(p.from_code == "en" and p.to_code == "ru" for p in installed):
+                self._translator_ready = True
+                self.after(0, self._set_status, "Translation ready — listening…")
+            else:
+                log.warning("argostranslate en→ru package not found")
                 self.after(0, self._revert_translate_flags)
+                self.after(0, self._set_status, "Translation package missing — run download_translation_model.py")
         except Exception as exc:  # noqa: BLE001
-            log.warning("Translation model load failed: %s", exc)
+            log.warning("Translation check failed: %s", exc)
             self.after(0, self._revert_translate_flags)
         finally:
             self._translator_loading = False
@@ -937,16 +931,16 @@ class App(tk.Tk):
     # ── main-thread UI updates ────────────────────────────────────────────────
 
     def _translate(self, text: str) -> str | None:
-        """Translate *text* English→Russian via the loaded OPUS-MT model.
+        """Translate *text* English→Russian via argostranslate (fully offline).
 
-        Returns the Russian string on success, or None if the model is not
-        loaded (not yet downloaded / still loading).
+        Returns the Russian string on success, or None if the language pack
+        is not installed yet.
         """
-        if self._opus_translator is None or self._opus_tokenizer is None:
+        if not self._translator_ready:
             return None
         try:
-            from transcriber import _do_translate  # noqa: PLC0415
-            return _do_translate(text, self._opus_translator, self._opus_tokenizer)
+            from argostranslate import translate as _at  # noqa: PLC0415
+            return _at.translate(text, "en", "ru")
         except Exception as exc:  # noqa: BLE001
             log.warning("Translation failed: %s", exc)
             return None

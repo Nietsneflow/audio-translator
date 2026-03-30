@@ -92,11 +92,6 @@ log = get_logger(__name__)
 # falls back to downloading from HuggingFace automatically.
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
-# Path to the locally converted OPUS-MT en→ru CTranslate2 model.
-# Download once by running:  python download_translation_model.py
-_TRANSLATION_MODEL_DIR = os.path.join(_MODELS_DIR, "opus-mt-en-ru")
-
-
 # ── Hallucination filters ─────────────────────────────────────────────────────
 
 # Common single-word / short-phrase Whisper hallucinations on near-silence.
@@ -161,49 +156,6 @@ def _is_repetition_loop(text: str, min_repeats: int = 6) -> bool:
             )
             return True
     return False
-
-
-def _load_opus_translator(on_status):
-    """Lazily load the local OPUS-MT en→ru model.
-
-    Returns (ctranslate2.Translator, tokenizer) on success, or (None, None) if
-    the model has not been downloaded yet or an import fails.
-    """
-    try:
-        import ctranslate2 as _ct2  # noqa: PLC0415
-        from transformers import AutoTokenizer  # noqa: PLC0415
-    except ImportError as exc:
-        log.warning("Translation dependencies not installed: %s", exc)
-        on_status("Translation unavailable — run: pip install transformers sentencepiece")
-        return None, None
-
-    if not os.path.isfile(os.path.join(_TRANSLATION_MODEL_DIR, "model.bin")):
-        log.warning("OPUS-MT model not found at %s", _TRANSLATION_MODEL_DIR)
-        on_status("Translation model not found — run download_translation_model.py first")
-        return None, None
-
-    try:
-        on_status("Loading translation model…")
-        translator = _ct2.Translator(_TRANSLATION_MODEL_DIR, device="cpu", inter_threads=1)
-        tokenizer = AutoTokenizer.from_pretrained(_TRANSLATION_MODEL_DIR)
-        log.info("OPUS-MT translator loaded from %s", _TRANSLATION_MODEL_DIR)
-        on_status("Translation model ready — listening…")
-        return translator, tokenizer
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not load OPUS-MT model: %s", exc)
-        on_status(f"Translation model failed to load: {exc}")
-        return None, None
-
-
-def _do_translate(text: str, translator, tokenizer) -> str:
-    """Translate a single English string to Russian via the local OPUS-MT model."""
-    tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-    results = translator.translate_batch([tokens])
-    target_tokens = results[0].hypotheses[0]
-    return tokenizer.decode(
-        tokenizer.convert_tokens_to_ids(target_tokens),
-        skip_special_tokens=True,
-    )
 
 
 def _resolve_model_path(model_size: str) -> str:
