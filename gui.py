@@ -111,6 +111,12 @@ class App(tk.Tk):
         self._view_ts_var      = tk.BooleanVar(value=_cfg.get("view_ts",            True))
         self._view_lang_var    = tk.BooleanVar(value=_cfg.get("view_lang",           False))
 
+        # ── Translation ───────────────────────────────────────────────────────
+        self._translate_to_ru_var = tk.BooleanVar(value=_cfg.get("translate_to_ru", False))
+        self._translate_event  = threading.Event()
+        if self._translate_to_ru_var.get():
+            self._translate_event.set()
+
         self._model_var = tk.StringVar(value=_cfg.get("model", DEFAULT_MODEL_LABEL))
         self._processor_var = tk.StringVar(value=_cfg.get("processor", "Auto"))
 
@@ -525,6 +531,12 @@ class App(tk.Tk):
         menu.add_cascade(label="Live View \u25ba", menu=live_menu)
 
         menu.add_separator()
+        menu.add_checkbutton(
+            label="Translate English \u2192 Russian",
+            variable=self._translate_to_ru_var,
+            command=self._on_translate_toggle,
+        )
+        menu.add_separator()
         menu.add_checkbutton(label="Always on top", variable=self._ontop_var, command=self._toggle_ontop)
 
     def _rebuild_sources_menu(self):
@@ -654,6 +666,14 @@ class App(tk.Tk):
     def _toggle_ontop(self):
         self.attributes("-topmost", self._ontop_var.get())
 
+    def _on_translate_toggle(self):
+        """Sync the translate threading.Event with the BooleanVar, then re-post menu."""
+        if self._translate_to_ru_var.get():
+            self._translate_event.set()
+        else:
+            self._translate_event.clear()
+        self._save_repost()
+
     def _toggle(self):
         if self._running:
             self._stop()
@@ -723,6 +743,7 @@ class App(tk.Tk):
             on_device_info=self._on_device_info,
             model_label=self._model_var.get(),
             force_device=self._processor_var.get(),
+            translate_event=self._translate_event,
         )
 
         self._capture_thread.start()
@@ -1073,6 +1094,7 @@ class App(tk.Tk):
             data["file_combined_src"]= self._file_com_src_var.get()
             data["view_ts"]          = self._view_ts_var.get()
             data["view_lang"]        = self._view_lang_var.get()
+            data["translate_to_ru"]  = self._translate_to_ru_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:

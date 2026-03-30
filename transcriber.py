@@ -92,6 +92,53 @@ log = get_logger(__name__)
 # falls back to downloading from HuggingFace automatically.
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
+# Path to the locally converted OPUS-MT en→ru CTranslate2 model.
+# Download once by running:  python download_translation_model.py
+_TRANSLATION_MODEL_DIR = os.path.join(_MODELS_DIR, "opus-mt-en-ru")
+
+
+def _load_opus_translator(on_status):
+    """Lazily load the local OPUS-MT en→ru model.
+
+    Returns (ctranslate2.Translator, tokenizer) on success, or (None, None) if
+    the model has not been downloaded yet or an import fails.
+    """
+    try:
+        import ctranslate2 as _ct2  # noqa: PLC0415
+        from transformers import AutoTokenizer  # noqa: PLC0415
+    except ImportError as exc:
+        log.warning("Translation dependencies not installed: %s", exc)
+        on_status("Translation unavailable — run: pip install transformers sentencepiece")
+        return None, None
+
+    if not os.path.isfile(os.path.join(_TRANSLATION_MODEL_DIR, "model.bin")):
+        log.warning("OPUS-MT model not found at %s", _TRANSLATION_MODEL_DIR)
+        on_status("Translation model not found — run download_translation_model.py first")
+        return None, None
+
+    try:
+        on_status("Loading translation model…")
+        translator = _ct2.Translator(_TRANSLATION_MODEL_DIR, device="cpu", inter_threads=1)
+        tokenizer = AutoTokenizer.from_pretrained(_TRANSLATION_MODEL_DIR)
+        log.info("OPUS-MT translator loaded from %s", _TRANSLATION_MODEL_DIR)
+        on_status("Translation model ready — listening…")
+        return translator, tokenizer
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not load OPUS-MT model: %s", exc)
+        on_status(f"Translation model failed to load: {exc}")
+        return None, None
+
+
+def _do_translate(text: str, translator, tokenizer) -> str:
+    """Translate a single English string to Russian via the local OPUS-MT model."""
+    tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+    results = translator.translate_batch([tokens])
+    target_tokens = results[0].hypotheses[0]
+    return tokenizer.decode(
+        tokenizer.convert_tokens_to_ids(target_tokens),
+        skip_special_tokens=True,
+    )
+
 
 def _resolve_model_path(model_size: str) -> str:
     """Return local path if bundled models exist, else the HuggingFace model ID."""
@@ -135,6 +182,7 @@ class TranscriberThread(threading.Thread):
         on_device_info: Callable[[str, str], None] | None = None,
         model_label: str = DEFAULT_MODEL_LABEL,
         force_device: str = "Auto",  # "Auto" | "GPU" | "CPU"
+        translate_event: threading.Event | None = None,  # set=ON, clear=OFF
     ):
         super().__init__(daemon=True, name="TranscriberThread")
         self.audio_queue = audio_queue
@@ -144,6 +192,7 @@ class TranscriberThread(threading.Thread):
         self.on_device_info = on_device_info or (lambda d, c: None)
         self.model_size = MODEL_OPTIONS.get(model_label, "medium")
         self.force_device = force_device
+        self.translate_event = translate_event
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -251,6 +300,9 @@ class TranscriberThread(threading.Thread):
 
         utterance_seq = 0
         SAMPLE_RATE = 16_000
+        # OPUS-MT translator + tokenizer — loaded lazily on first use.
+        _opus_translator = None
+        _opus_tokenizer = None
         # Maximum utterances to keep when the queue has backed up.
         # Any older items are dropped — they are stale and translating them
         # all at once would cause a second GPU spike after the game frees up.
@@ -359,10 +411,29 @@ class TranscriberThread(threading.Thread):
                     )
                     for segment in segments:
                         text = segment.text.strip()
-                        if text:
-                            ts = time.strftime("%H:%M:%S")
-                            log.info("[%s] %s %s", ts, seq_label, text)
-                            self.on_result(ts, text, info.language, grp_src)
+                        if not text:
+                            continue
+                        out_lang = info.language
+                        # Translate English → Russian if toggle is on and
+                        # Whisper detected the source as English.
+                        if (
+                            self.translate_event is not None
+                            and self.translate_event.is_set()
+                            and info.language == "en"
+                        ):
+                            if _opus_translator is None:
+                                _opus_translator, _opus_tokenizer = _load_opus_translator(
+                                    self.on_status
+                                )
+                            if _opus_translator is not None and _opus_tokenizer is not None:
+                                try:
+                                    text = _do_translate(text, _opus_translator, _opus_tokenizer)
+                                    out_lang = "en→ru"
+                                except Exception as _tx_exc:  # noqa: BLE001
+                                    log.warning("Translation failed for segment: %s", _tx_exc)
+                        ts = time.strftime("%H:%M:%S")
+                        log.info("[%s] %s %s", ts, seq_label, text)
+                        self.on_result(ts, text, out_lang, grp_src)
                     # Never break out of the segment generator mid-inference.
                     # Interrupting the lazy ctranslate2 generator leaves its
                     # internal C++ decoder state allocated; when the model is
