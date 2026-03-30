@@ -182,7 +182,6 @@ class TranscriberThread(threading.Thread):
         on_device_info: Callable[[str, str], None] | None = None,
         model_label: str = DEFAULT_MODEL_LABEL,
         force_device: str = "Auto",  # "Auto" | "GPU" | "CPU"
-        translate_event: threading.Event | None = None,  # set=ON, clear=OFF
     ):
         super().__init__(daemon=True, name="TranscriberThread")
         self.audio_queue = audio_queue
@@ -192,7 +191,6 @@ class TranscriberThread(threading.Thread):
         self.on_device_info = on_device_info or (lambda d, c: None)
         self.model_size = MODEL_OPTIONS.get(model_label, "medium")
         self.force_device = force_device
-        self.translate_event = translate_event
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -300,9 +298,6 @@ class TranscriberThread(threading.Thread):
 
         utterance_seq = 0
         SAMPLE_RATE = 16_000
-        # OPUS-MT translator + tokenizer — loaded lazily on first use.
-        _opus_translator = None
-        _opus_tokenizer = None
         # Maximum utterances to keep when the queue has backed up.
         # Any older items are dropped — they are stale and translating them
         # all at once would cause a second GPU spike after the game frees up.
@@ -413,27 +408,9 @@ class TranscriberThread(threading.Thread):
                         text = segment.text.strip()
                         if not text:
                             continue
-                        out_lang = info.language
-                        # Translate English → Russian if toggle is on and
-                        # Whisper detected the source as English.
-                        if (
-                            self.translate_event is not None
-                            and self.translate_event.is_set()
-                            and info.language == "en"
-                        ):
-                            if _opus_translator is None:
-                                _opus_translator, _opus_tokenizer = _load_opus_translator(
-                                    self.on_status
-                                )
-                            if _opus_translator is not None and _opus_tokenizer is not None:
-                                try:
-                                    text = _do_translate(text, _opus_translator, _opus_tokenizer)
-                                    out_lang = "en→ru"
-                                except Exception as _tx_exc:  # noqa: BLE001
-                                    log.warning("Translation failed for segment: %s", _tx_exc)
                         ts = time.strftime("%H:%M:%S")
                         log.info("[%s] %s %s", ts, seq_label, text)
-                        self.on_result(ts, text, out_lang, grp_src)
+                        self.on_result(ts, text, info.language, grp_src)
                     # Never break out of the segment generator mid-inference.
                     # Interrupting the lazy ctranslate2 generator leaves its
                     # internal C++ decoder state allocated; when the model is
