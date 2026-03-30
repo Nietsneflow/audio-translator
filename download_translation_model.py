@@ -30,7 +30,7 @@ def main() -> None:
     # ── 2. Check whether the en→ru package is already installed ──────────────
     installed = package.get_installed_packages()
     if any(p.from_code == "en" and p.to_code == "ru" for p in installed):
-        print("English→Russian translation package already installed. Nothing to do.")
+        print("English->Russian translation package already installed. Nothing to do.")
         return
 
     # ── 3. Download package index and install en→ru ───────────────────────────
@@ -45,14 +45,14 @@ def main() -> None:
     if pkg is None:
         sys.exit("ERROR: en→ru package not found in the argostranslate index.")
 
-    print(f"Downloading {pkg} (~80 MB)…  Please wait.")
+    print(f"Downloading {pkg} (~80 MB)...  Please wait.")
     package.install_from_path(pkg.download())
 
     # ── 4. Quick smoke-test ───────────────────────────────────────────────────
     from argostranslate import translate
     result = translate.translate("Hello", "en", "ru")
-    print(f"\nSmoke-test: 'Hello' → '{result}'")
-    print("\nDone. You can now enable 'Translate English → Russian' in the app.")
+    print(f"\nSmoke-test: 'Hello' -> '{result}'")
+    print("\nDone. You can now enable 'Translate English -> Russian' in the app.")
 
 
 if __name__ == "__main__":
