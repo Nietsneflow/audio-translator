@@ -146,7 +146,10 @@ class AudioCaptureThread(threading.Thread):
         self._on_level = on_level  # callable(rms: float) or None
         self.source_id = source_id
         self._level_frame_count = 0
-        self._stop_event = threading.Event()
+        self._stop_event = threading.Event()  # set = stop requested; starts clear
+
+    def stop(self):
+        """Signal the capture loop to exit cleanly."""
         self._stop_event.set()
 
     def run(self):
