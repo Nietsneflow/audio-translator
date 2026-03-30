@@ -114,11 +114,11 @@ class TranscriberThread(threading.Thread):
     """
     Background thread that:
       1. Loads a faster-whisper WhisperModel (CUDA if available, else CPU).
-      2. Reads (tag, payload) tuples from *audio_queue*:
-           - ("audio", np.ndarray)  → transcribe/translate and call *on_result*
-           - ("error", str)         → forward error to *on_error*
-           - ("stop", None)         → exit cleanly
-      3. Calls *on_result(timestamp: str, text: str)* for each translated segment.
+      2. Reads (tag, payload, source_id) 3-tuples from *audio_queue*:
+           - ("audio", np.ndarray, int)  → transcribe/translate and call *on_result*
+           - ("error", str, int)         → forward error to *on_error*
+           - ("stop", None, 0)           → exit cleanly
+      3. Calls *on_result(timestamp, text, language, source_id)* for each segment.
       4. Calls *on_error(message: str)* on errors.
       5. Calls *on_status(message: str)* for status messages (model loading, etc.).
       6. Calls *on_device_info(device: str, compute_type: str)* once the model

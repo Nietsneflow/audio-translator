@@ -1,8 +1,10 @@
 """
 gui.py
-tkinter GUI for the Russian → English live translator.
-Provides: device selector, model selector, start/stop button,
-always-on-top toggle, and a scrolling caption area.
+tkinter GUI for the live audio translator.
+Provides: Sources cascade menu, model/processor selectors, start/stop,
+options (timestamps, language tag, always-on-top), side-by-side dual
+transcript panes, independent per-source audio level meters, and
+persistent output to Source1.txt / Source2.txt / output.txt.
 """
 
 import collections
@@ -74,18 +76,19 @@ class App(tk.Tk):
             os.path.dirname(os.path.abspath(__file__)), "config.json"
         )
 
-        saved_threshold = self._load_config().get("threshold", SPEECH_THRESHOLD)
+        _cfg = self._load_config()
+
+        saved_threshold = _cfg.get("threshold", SPEECH_THRESHOLD)
         self._threshold_var = tk.DoubleVar(value=saved_threshold)
         self._threshold_display_var = tk.StringVar(value=f"{saved_threshold:.3f}")
-        saved_silence = int(self._load_config().get("end_silence_ms", END_SILENCE_MS))
+        saved_silence = int(_cfg.get("end_silence_ms", END_SILENCE_MS))
         self._silence_var = tk.IntVar(value=saved_silence)
         self._silence_display_var = tk.StringVar(value=f"{saved_silence} ms")
 
-        _cfg2 = self._load_config()
-        s2_thresh = _cfg2.get("s2_threshold", SPEECH_THRESHOLD)
+        s2_thresh = _cfg.get("s2_threshold", SPEECH_THRESHOLD)
         self._s2_threshold_var = tk.DoubleVar(value=s2_thresh)
         self._s2_threshold_display_var = tk.StringVar(value=f"{s2_thresh:.3f}")
-        s2_sil = int(_cfg2.get("s2_end_silence_ms", END_SILENCE_MS))
+        s2_sil = int(_cfg.get("s2_end_silence_ms", END_SILENCE_MS))
         self._s2_silence_var = tk.IntVar(value=s2_sil)
         self._s2_silence_display_var = tk.StringVar(value=f"{s2_sil} ms")
 
@@ -93,10 +96,8 @@ class App(tk.Tk):
         self._meter_peak = 0.0
         self._s2_meter_peak = 0.0
 
-        _cfg = self._load_config()
         self._saved_model = _cfg.get("model", DEFAULT_MODEL_LABEL)
         self._saved_processor = _cfg.get("processor", "Auto")
-        self._saved_device = _cfg.get("device", None)  # legacy fallback
         self._s1_device = _cfg.get("s1_device", _cfg.get("device", None))
         self._s2_device = _cfg.get("s2_device", None)  # None = disabled
         self._ts_in_output_var = tk.BooleanVar(value=_cfg.get("ts_in_output", True))
@@ -546,11 +547,6 @@ class App(tk.Tk):
         if self._running:
             self._restart_capture_all()
 
-    def _on_device_selected(self, _event=None):
-        self._save_config()
-        if self._running:
-            self._restart_capture_all()
-
     def _restart_capture_all(self):
         """Stop all capture threads and restart with current S1/S2 settings."""
         if not self._s1_device:
@@ -699,7 +695,9 @@ class App(tk.Tk):
         self._model_combo.config(state="readonly")
         self._proc_combo.config(state="readonly")
         self._meter_peak = 0.0
+        self._s2_meter_peak = 0.0
         self._meter_rms_var.set("RMS: 0.000")
+        self._meter_rms_s2_var.set("RMS: 0.000")
         close_session_log()
 
     def _clear_text(self):
@@ -915,7 +913,9 @@ class App(tk.Tk):
         self._meter_rms_var.set(f"RMS: {rms:.4f}")
         if not self._meter_visible:
             return
-        c = self._meter_canvas
+        c = getattr(self, "_meter_canvas", None)
+        if c is None:
+            return
         w = c.winfo_width()
         h = c.winfo_height()
         if w < 2 or h < 2:
