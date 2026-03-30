@@ -301,7 +301,7 @@ class App(tk.Tk):
         st = scrolledtext.ScrolledText(
             parent, bg=TEXT_BG, fg=FG, font=("Segoe UI", 13),
             wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
-            padx=12, pady=10, insertbackground=FG
+            padx=12, pady=10, insertbackground=FG, width=1
         )
         st.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         st.tag_configure("ts", foreground=ACCENT, font=("Segoe UI", 10))
