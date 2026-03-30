@@ -297,7 +297,8 @@ class App(tk.Tk):
     def _make_text_pane(self, parent: tk.Frame, label: str) -> scrolledtext.ScrolledText:
         """Create a labeled transcript pane inside *parent*. Returns the ScrolledText."""
         tk.Label(parent, text=label, bg=BG, fg=ACCENT,
-                 font=("Segoe UI", 9, "bold"), pady=3).pack(fill=tk.X, padx=8)
+                 font=("Segoe UI", 9, "bold"), pady=3,
+                 width=1).pack(fill=tk.X, padx=8)
         st = scrolledtext.ScrolledText(
             parent, bg=TEXT_BG, fg=FG, font=("Segoe UI", 13),
             wrap=tk.WORD, state=tk.DISABLED, relief=tk.FLAT,
@@ -324,6 +325,9 @@ class App(tk.Tk):
         """Destroy and recreate transcript pane(s) based on whether S2 is active."""
         for child in self._transcript_container.winfo_children():
             child.destroy()
+        # Reset any previous grid config
+        for col in range(self._transcript_container.grid_size()[0] or 3):
+            self._transcript_container.columnconfigure(col, weight=0, uniform="")
         self._text = None
         self._text_s2 = None
 
@@ -331,18 +335,24 @@ class App(tk.Tk):
         s1_name = self._s1_device or "Source 1"
         s2_name = self._s2_device or "Source 2"
 
+        self._transcript_container.rowconfigure(0, weight=1)
         if s2_active:
+            # Equal-width columns enforced by uniform group
+            self._transcript_container.columnconfigure(0, weight=1, uniform="pane")
+            self._transcript_container.columnconfigure(1, weight=0, uniform="")
+            self._transcript_container.columnconfigure(2, weight=1, uniform="pane")
             f1 = tk.Frame(self._transcript_container, bg=BG)
-            f1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            tk.Frame(self._transcript_container, bg="#45475a", width=2).pack(
-                side=tk.LEFT, fill=tk.Y, pady=4)
+            f1.grid(row=0, column=0, sticky="nsew")
+            tk.Frame(self._transcript_container, bg="#45475a", width=2).grid(
+                row=0, column=1, sticky="ns", pady=4)
             f2 = tk.Frame(self._transcript_container, bg=BG)
-            f2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            f2.grid(row=0, column=2, sticky="nsew")
             self._text = self._make_text_pane(f1, f"Source 1 — {s1_name}")
             self._text_s2 = self._make_text_pane(f2, f"Source 2 — {s2_name}")
         else:
+            self._transcript_container.columnconfigure(0, weight=1, uniform="")
             f1 = tk.Frame(self._transcript_container, bg=BG)
-            f1.pack(fill=tk.BOTH, expand=True)
+            f1.grid(row=0, column=0, sticky="nsew")
             self._text = self._make_text_pane(f1, f"Source 1 — {s1_name}")
 
     def _build_single_meter_col(self, parent: tk.Frame,
