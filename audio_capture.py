@@ -167,7 +167,7 @@ class AudioCaptureThread(threading.Thread):
             device = get_loopback_device(self.device_name)
         except RuntimeError as exc:
             log.error("Device selection failed: %s", exc)
-            self.audio_queue.put(("error", str(exc)))
+            self.audio_queue.put(("error", str(exc), self.source_id))
             return
 
         # Raw read block size; smaller = more responsive stop detection.

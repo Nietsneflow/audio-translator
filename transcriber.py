@@ -313,7 +313,7 @@ class TranscriberThread(threading.Thread):
             utterance_seq += len(audio_parts)
             seq_end = utterance_seq
             seq_label = f"#{seq_start}" if seq_start == seq_end else f"#{seq_start}–{seq_end}"
-            batch_count = len(audio_parts)
+
 
             # Group consecutive same-source items; process each group separately.
             groups: list[tuple[int, list]] = []  # (source_id, [audio_arrays])

@@ -59,7 +59,6 @@ class App(tk.Tk):
         self._running = False
         self._poll_id: str | None = None  # after() handle for queue-depth polling
         self._stats_stop = threading.Event()  # signals the stats thread to exit
-        self._device_info: tuple[str, str] | None = None  # (device, compute_type)
         self._output_lines: collections.deque = collections.deque(maxlen=20)
         self._s2_output_lines: collections.deque = collections.deque(maxlen=20)
         self._combined_output_lines: collections.deque = collections.deque(maxlen=40)
@@ -96,12 +95,13 @@ class App(tk.Tk):
         self._meter_peak = 0.0
         self._s2_meter_peak = 0.0
 
-        self._saved_model = _cfg.get("model", DEFAULT_MODEL_LABEL)
-        self._saved_processor = _cfg.get("processor", "Auto")
         self._s1_device = _cfg.get("s1_device", _cfg.get("device", None))
         self._s2_device = _cfg.get("s2_device", None)  # None = disabled
         self._ts_in_output_var = tk.BooleanVar(value=_cfg.get("ts_in_output", True))
         self._show_lang_tag_var = tk.BooleanVar(value=_cfg.get("show_lang_tag", False))
+        self._info_tags_in_file_var = tk.BooleanVar(value=_cfg.get("info_tags_in_file", True))
+        self._model_var = tk.StringVar(value=_cfg.get("model", DEFAULT_MODEL_LABEL))
+        self._processor_var = tk.StringVar(value=_cfg.get("processor", "Auto"))
 
         self._build_ui()
         self._refresh_devices()
@@ -141,7 +141,6 @@ class App(tk.Tk):
         tk.Label(ctrl, text="Model:", bg=BG, fg=FG).grid(
             row=0, column=2, sticky=tk.W
         )
-        self._model_var = tk.StringVar(value=self._saved_model)
         self._model_combo = ttk.Combobox(
             ctrl, textvariable=self._model_var,
             values=list(MODEL_OPTIONS.keys()), state="readonly"
@@ -153,7 +152,6 @@ class App(tk.Tk):
         tk.Label(ctrl, text="Processor:", bg=BG, fg=FG).grid(
             row=0, column=4, sticky=tk.W
         )
-        self._processor_var = tk.StringVar(value=self._saved_processor)
         self._proc_combo = ttk.Combobox(
             ctrl, textvariable=self._processor_var,
             values=["Auto", "GPU", "CPU"], state="readonly", width=6
@@ -179,6 +177,10 @@ class App(tk.Tk):
         )
         options_menu.add_checkbutton(
             label="Language tag in transcript", variable=self._show_lang_tag_var,
+            command=self._save_config
+        )
+        options_menu.add_checkbutton(
+            label="Info tags in file  ([ru], {S1}\u2026)", variable=self._info_tags_in_file_var,
             command=self._save_config
         )
         options_menu.add_checkbutton(
@@ -687,7 +689,6 @@ class App(tk.Tk):
             self._capture_thread_s2.stop()
         self._capture_thread_s2 = None
         self._running = False
-        self._device_info = None
         self._queue_var.set("")
         self._hw_var.set("")
         self._hw_label.config(bg=ENTRY_BG)
@@ -793,7 +794,7 @@ class App(tk.Tk):
         widget.see(tk.END)
         widget.config(state=tk.DISABLED)
 
-        lang_prefix = f"[{language}] " if self._show_lang_tag_var.get() else ""
+        lang_prefix = f"[{language}] " if self._info_tags_in_file_var.get() else ""
         line = f"{lang_prefix}{text}"
         ts_line = f"[{timestamp}] {line}" if self._ts_in_output_var.get() else line
         src_tag = "{S1}" if source_id == 1 else "{S2}"
@@ -805,7 +806,7 @@ class App(tk.Tk):
             self._s2_output_lines.append(ts_line)
             self._write_source_file(self._s2_output_file, self._s2_output_lines)
 
-        combined_line = f"{src_tag} {ts_line}"
+        combined_line = f"{src_tag} {ts_line}" if self._info_tags_in_file_var.get() else ts_line
         self._combined_output_lines.append(combined_line)
         self._write_source_file(self._combined_output_file, self._combined_output_lines)
 
@@ -827,7 +828,6 @@ class App(tk.Tk):
         self._status_var.set(message)
 
     def _set_device_chip(self, device: str, compute_type: str):
-        self._device_info = (device, compute_type)
         if device == "cuda":
             label = "◆ GPU"
             colour = "#a6e3a1"  # green
@@ -990,6 +990,7 @@ class App(tk.Tk):
             data["s2_end_silence_ms"] = self._s2_silence_var.get()
             data["ts_in_output"] = self._ts_in_output_var.get()
             data["show_lang_tag"] = self._show_lang_tag_var.get()
+            data["info_tags_in_file"] = self._info_tags_in_file_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:
