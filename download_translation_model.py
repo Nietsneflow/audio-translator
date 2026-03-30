@@ -1,9 +1,9 @@
 """
 download_translation_model.py
 
-One-time setup: installs argostranslate and downloads the English→Russian
+One-time setup: installs argostranslate and downloads the English->Russian
 language package (~80 MB).  After running this script the "Translate
-English → Russian" toggles in the app will work fully offline.
+English -> Russian" toggles in the app will work fully offline.
 
 Run once:
     python download_translation_model.py
@@ -19,7 +19,7 @@ def main() -> None:
         import argostranslate.package  # noqa: F401
         print("argostranslate already installed.")
     except ImportError:
-        print("Installing argostranslate…")
+        print("Installing argostranslate...")
         subprocess.check_call([
             sys.executable, "-m", "pip", "install", "argostranslate>=1.9.0", "-q",
         ])
@@ -34,7 +34,7 @@ def main() -> None:
         return
 
     # ── 3. Download package index and install en→ru ───────────────────────────
-    print("Fetching argostranslate package index…")
+    print("Fetching argostranslate package index...")
     package.update_package_index()
 
     available = package.get_available_packages()
@@ -43,9 +43,9 @@ def main() -> None:
         None,
     )
     if pkg is None:
-        sys.exit("ERROR: en→ru package not found in the argostranslate index.")
+        sys.exit("ERROR: en->ru package not found in the argostranslate index.")
 
-    print(f"Downloading {pkg} (~80 MB)...  Please wait.")
+    print("Downloading en->ru language pack (~80 MB)...  Please wait.")
     package.install_from_path(pkg.download())
 
     # ── 4. Quick smoke-test ───────────────────────────────────────────────────
