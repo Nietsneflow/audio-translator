@@ -681,27 +681,71 @@ class App(tk.Tk):
     def _on_translate_toggle(self):
         """Called when any per-output translate toggle changes.
 
-        If any translate flag is now on and the model isn't loaded yet, start
-        a background thread to load it.  Then re-post the Options menu.
+        Upfront check: if the model files or required packages are missing,
+        show a clear error dialog and revert the checkbox rather than silently
+        doing nothing.  Otherwise start a background load if needed.
         """
         any_on = any(v.get() for v in (
             self._file_s1_translate_var, self._file_s2_translate_var,
             self._file_com_translate_var, self._view_translate_var,
         ))
         if any_on and self._opus_translator is None and not self._translator_loading:
+            # Check pre-requisites before starting the background load.
+            model_bin = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "models", "opus-mt-en-ru", "model.bin",
+            )
+            try:
+                import transformers as _tr  # noqa: F401,PLC0415
+                import sentencepiece as _sp  # noqa: F401,PLC0415
+                packages_ok = True
+            except ImportError:
+                packages_ok = False
+
+            if not packages_ok or not os.path.isfile(model_bin):
+                # Revert all translate flags so the checkbuttons aren't left
+                # ticked in an unusable state.
+                for v in (self._file_s1_translate_var, self._file_s2_translate_var,
+                          self._file_com_translate_var, self._view_translate_var):
+                    v.set(False)
+                messagebox.showinfo(
+                    "Translation model not ready",
+                    "The offline translation model has not been downloaded yet.\n\n"
+                    "Run this command once in a terminal, then restart the app:\n\n"
+                    "    python download_translation_model.py\n\n"
+                    "This downloads ~80 MB and installs the required packages.\n"
+                    "After that, the translate toggles will work."
+                )
+                self._save_repost()
+                return
+
             self._translator_loading = True
             threading.Thread(target=self._load_translator_bg, daemon=True).start()
         self._save_repost()
 
     def _load_translator_bg(self):
         """Background thread: lazily load OPUS-MT translator + tokenizer once."""
-        from transcriber import _load_opus_translator  # noqa: PLC0415
-        translator, tokenizer = _load_opus_translator(
-            lambda msg: self.after(0, self._set_status, msg)
-        )
-        self._opus_translator = translator
-        self._opus_tokenizer  = tokenizer
-        self._translator_loading = False
+        try:
+            from transcriber import _load_opus_translator  # noqa: PLC0415
+            translator, tokenizer = _load_opus_translator(
+                lambda msg: self.after(0, self._set_status, msg)
+            )
+            self._opus_translator = translator
+            self._opus_tokenizer  = tokenizer
+            if translator is None:
+                # Load failed — revert all translate flags so user isn't confused
+                self.after(0, self._revert_translate_flags)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Translation model load failed: %s", exc)
+            self.after(0, self._revert_translate_flags)
+        finally:
+            self._translator_loading = False
+
+    def _revert_translate_flags(self):
+        for v in (self._file_s1_translate_var, self._file_s2_translate_var,
+                  self._file_com_translate_var, self._view_translate_var):
+            v.set(False)
+        self._save_config()
 
     def _toggle(self):
         if self._running:
