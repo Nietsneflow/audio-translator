@@ -78,6 +78,7 @@ class App(tk.Tk):
         self._saved_model = _cfg.get("model", DEFAULT_MODEL_LABEL)
         self._saved_processor = _cfg.get("processor", "Auto")
         self._saved_device = _cfg.get("device", None)
+        self._ts_in_output_var = tk.BooleanVar(value=_cfg.get("ts_in_output", True))
 
         self._build_ui()
         self._refresh_devices()
@@ -136,14 +137,28 @@ class App(tk.Tk):
         self._proc_combo.grid(row=0, column=6, padx=(4, 12), sticky=tk.W)
         self._proc_combo.bind("<<ComboboxSelected>>", lambda _: self._save_config())
 
-        # Always-on-top toggle
+        # Options dropdown (Timestamps in file + Always on top)
         self._ontop_var = tk.BooleanVar(value=False)
-        ontop_cb = tk.Checkbutton(
-            ctrl, text="Always on top", variable=self._ontop_var,
-            bg=BG, fg=FG, selectcolor=ENTRY_BG, activebackground=BG,
+        options_btn = tk.Menubutton(
+            ctrl, text="Options ▾", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
+            font=("Segoe UI", 10), padx=10, pady=4, cursor="hand2",
+            activebackground="#3e3e5e", activeforeground=FG
+        )
+        options_menu = tk.Menu(
+            options_btn, tearoff=0, bg=ENTRY_BG, fg=FG,
+            activebackground="#3e3e5e", activeforeground=FG,
+            selectcolor=FG
+        )
+        options_menu.add_checkbutton(
+            label="Timestamps in file", variable=self._ts_in_output_var,
+            command=self._save_config
+        )
+        options_menu.add_checkbutton(
+            label="Always on top", variable=self._ontop_var,
             command=self._toggle_ontop
         )
-        ontop_cb.grid(row=0, column=7, padx=(0, 12), sticky=tk.W)
+        options_btn["menu"] = options_menu
+        options_btn.grid(row=0, column=7, padx=(0, 12), sticky=tk.W)
 
         # Start / Stop button
         self._toggle_btn = tk.Button(
@@ -578,7 +593,10 @@ class App(tk.Tk):
         self._text.insert(tk.END, f"{text}\n", "txt")
         self._text.see(tk.END)
         self._text.config(state=tk.DISABLED)
-        self._output_lines.append(f"[{timestamp}] {text}")
+        if self._ts_in_output_var.get():
+            self._output_lines.append(f"[{timestamp}] {text}")
+        else:
+            self._output_lines.append(text)
         self._write_output_file()
 
     def _write_output_file(self):
@@ -698,6 +716,7 @@ class App(tk.Tk):
             data["model"] = self._model_var.get()
             data["processor"] = self._processor_var.get()
             data["device"] = self._device_var.get()
+            data["ts_in_output"] = self._ts_in_output_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:

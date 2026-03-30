@@ -106,7 +106,6 @@ def _resolve_model_path(model_size: str) -> str:
 MODEL_OPTIONS = {
     "small  (fast, ~500 MB)": "small",
     "medium (balanced, ~1.5 GB)": "medium",
-    "large  (best quality, ~3 GB)": "large-v2",
 }
 DEFAULT_MODEL_LABEL = "medium (balanced, ~1.5 GB)"
 

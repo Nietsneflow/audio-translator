@@ -11,7 +11,11 @@ the translation on screen.
 
 INSTALLATION
 ------------
-1. Extract this zip file to any folder (e.g. your Desktop).
+1. Download the full folder from Dropbox and save it anywhere
+   on your PC (e.g. your Desktop).
+
+   The folder includes the app files AND the speech recognition
+   models — no internet download of models is required.
 
 2. Double-click setup.bat
 
@@ -27,11 +31,15 @@ INSTALLATION
    any time in the future.
 
 
-FIRST LAUNCH
-------------
-The first time you run the app it will download the Whisper
-speech recognition model (500 MB - 1.5 GB depending on which
-model size you select in the app). This only happens once.
+MODELS
+------
+The speech recognition models are included in the models\ folder:
+
+  models\small\    - ~500 MB  (fast, good for CPU)
+  models\medium\   - ~1.5 GB  (more accurate, best with GPU)
+
+The app loads them directly from this folder — no internet
+connection is needed to start translating.
 
 
 GPU ACCELERATION (NVIDIA)
@@ -72,11 +80,8 @@ MODEL SIZE
 ----------
 Use the Model dropdown to choose translation quality vs speed:
 
-  tiny    - Fastest, lowest accuracy
-  base    - Fast, decent accuracy
-  small   - Good balance (recommended for CPU)
+  small   - Fast, good accuracy (recommended for CPU)
   medium  - Better accuracy (recommended for GPU)
-  large   - Best accuracy, slowest (GPU recommended)
 
 
 USAGE TIPS
@@ -100,5 +105,8 @@ FILES IN THIS PACKAGE
   requirements.txt  - Python dependency list
   setup.bat         - Installer (run this first)
   Launch.bat        - Start the app after installation
+  models\           - Bundled speech recognition models
+    small\          - Small model (~500 MB)
+    medium\         - Medium model (~1.5 GB)
 
 ================================================

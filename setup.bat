@@ -3,11 +3,11 @@
 :: ── Logging: re-run through PowerShell Tee so all output ──
 :: ── goes to both the console AND install_log.txt           ──
 if "%1"=="--logged" goto :main
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^windowed^
-    "cmd /c '\"%~f0\" --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "cmd /c '%~f0 --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
 exit /b %ERRORLEVEL%
 
 :main
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title Audio Translator - Installer
@@ -23,28 +23,38 @@ echo.
 python --version >nul 2>&1
 if not errorlevel 1 goto :python_ok
 
-echo [ERROR] Python not found. Attempting to install Python 3.11 via winget...
-echo (This requires Windows 10 version 1709 or later)
+echo Python not found. Installing Python 3.11 automatically...
+echo This may take a minute, please wait.
 echo.
 winget --version >nul 2>&1
 if errorlevel 1 goto :no_winget
 
 winget install --id Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements
 if errorlevel 1 goto :winget_failed
+echo Python 3.11 installed successfully.
 
-:: Refresh PATH for this session by locating the new python.exe
-for /f "tokens=*" %%p in ('where python 2^>nul') do (
-    set "PYTHON_EXE=%%p"
+:: winget installs Python but doesn't refresh the current cmd session's PATH.
+:: The Windows Store app alias also shadows 'python' in a fresh session.
+:: Look for the real python.exe directly in the known install locations.
+set "PYTHON_EXE="
+if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" (
+    set "PYTHON_EXE=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
     goto :python_found_path
 )
-:: If where fails, winget may have installed but PATH not yet refreshed
+if exist "%ProgramFiles%\Python311\python.exe" (
+    set "PYTHON_EXE=%ProgramFiles%\Python311\python.exe"
+    goto :python_found_path
+)
 echo.
-echo Python was installed but this window needs to be restarted to see it.
+echo Python was installed but could not be located automatically.
 echo Please close this window and double-click setup.bat again.
 pause
 exit /b 0
 
 :python_found_path
+:: Add the found Python to PATH for the rest of this session
+for %%d in ("%PYTHON_EXE%") do set "PATH=%%~dpd;%%~dpd\Scripts;%PATH%"
+set "PYTHON_EXE="
 goto :python_ok
 
 :no_winget
@@ -74,7 +84,7 @@ echo.
 
 :: ── Step 3: Core dependencies ─────────────────────
 echo [2/3] Installing core dependencies...
-pip install "faster-whisper>=1.0.0" "soundcard>=0.4.3" "numpy>=1.24.0,<2.0" "psutil>=5.9.0" "pynvml>=11.0.0"
+python -m pip install "faster-whisper>=1.0.0" "soundcard>=0.4.3" "numpy>=1.24.0,<2.0" "psutil>=5.9.0" "pynvml>=11.0.0"
 if errorlevel 1 (
     echo.
     echo [ERROR] Core dependency install failed.
@@ -90,7 +100,7 @@ echo [3/3] Installing PyTorch with CUDA support...
 echo       This downloads ~2.5 GB and may take several minutes.
 echo       If you have no NVIDIA GPU this still works - it will use CPU.
 echo.
-pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
+python -m pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
 if errorlevel 1 (
     echo.
     echo [ERROR] PyTorch install failed.
@@ -106,8 +116,8 @@ echo ================================================
 echo   Installation complete!
 echo ================================================
 echo.
-echo On first launch the Whisper speech recognition model
-echo will download automatically (500 MB - 1.5 GB).
+echo Speech recognition models are included in the models\ folder.
+echo No internet download of models is required.
 echo.
 echo Installation finished: %DATE% %TIME%
 echo.
