@@ -76,6 +76,45 @@ exit /b 1
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do echo Found: %%v
 echo.
 
+:: ── Step 1b: Ensure Git is available (needed for Update.bat) ─────────────
+git --version >nul 2>&1
+if not errorlevel 1 goto :git_ok
+
+echo Git not found. Installing Git automatically...
+winget --version >nul 2>&1
+if errorlevel 1 goto :git_no_winget
+
+winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements
+if errorlevel 1 goto :git_no_winget
+
+:: Refresh PATH so git is visible for the rest of this session
+for /f "tokens=*" %%p in ('where git 2^>nul') do set "PATH=%PATH%;%%~dpp"
+git --version >nul 2>&1
+if not errorlevel 1 (
+    echo Git installed successfully.
+    goto :git_ok
+)
+echo Git was installed but needs a restart to take effect.
+echo Close this window, open a new one, and re-run setup.bat to continue.
+pause
+exit /b 0
+
+:git_no_winget
+echo.
+echo Could not auto-install Git.
+echo Please download and install Git from:
+echo   https://git-scm.com/download/win
+echo Use all default options during install.
+echo Then double-click setup.bat again.
+echo.
+start https://git-scm.com/download/win
+pause
+exit /b 1
+
+:git_ok
+for /f "tokens=*" %%v in ('git --version 2^>^&1') do echo Found: %%v
+echo.
+
 :: ── Step 2: Upgrade pip ───────────────────────────
 echo [1/3] Upgrading pip...
 python -m pip install --upgrade pip -q

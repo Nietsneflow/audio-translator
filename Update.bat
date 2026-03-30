@@ -19,6 +19,15 @@ if errorlevel 1 (
     goto :done
 )
 
+:: Check this folder is a git repository
+if not exist ".git" (
+    echo ERROR: This folder was not set up via Git.
+    echo.
+    echo Update.bat only works if the app was installed by cloning the repository.
+    echo Please ask for a fresh install link or re-run setup.bat.
+    goto :done
+)
+
 :: Pull latest changes
 echo Checking for updates...
 echo.
@@ -26,8 +35,6 @@ git pull
 if errorlevel 1 (
     echo.
     echo Update failed. Check the error above.
-    echo If you see "not a git repository", the folder was not cloned via Git.
-    echo Ask for a fresh download link or re-clone the repository.
     goto :done
 )
 
@@ -35,12 +42,6 @@ if errorlevel 1 (
 echo.
 echo Updating dependencies...
 echo.
-call ".venv\Scripts\activate.bat" 2>nul
-if errorlevel 1 (
-    echo WARNING: Virtual environment not found at .venv\
-    echo Skipping dependency update.
-    goto :done
-)
 pip install -r requirements.txt -q
 if errorlevel 1 (
     echo WARNING: Dependency update had errors. The app may still work.
