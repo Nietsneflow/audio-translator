@@ -97,9 +97,20 @@ class App(tk.Tk):
 
         self._s1_device = _cfg.get("s1_device", _cfg.get("device", None))
         self._s2_device = _cfg.get("s2_device", None)  # None = disabled
-        self._ts_in_output_var = tk.BooleanVar(value=_cfg.get("ts_in_output", True))
-        self._show_lang_tag_var = tk.BooleanVar(value=_cfg.get("show_lang_tag", False))
-        self._info_tags_in_file_var = tk.BooleanVar(value=_cfg.get("info_tags_in_file", True))
+
+        # ── Per-file output options ───────────────────────────────────────────
+        self._file_s1_ts_var   = tk.BooleanVar(value=_cfg.get("file_s1_ts",        True))
+        self._file_s1_lang_var = tk.BooleanVar(value=_cfg.get("file_s1_lang",       False))
+        self._file_s2_ts_var   = tk.BooleanVar(value=_cfg.get("file_s2_ts",        True))
+        self._file_s2_lang_var = tk.BooleanVar(value=_cfg.get("file_s2_lang",       False))
+        self._file_com_ts_var  = tk.BooleanVar(value=_cfg.get("file_combined_ts",   True))
+        self._file_com_lang_var= tk.BooleanVar(value=_cfg.get("file_combined_lang",  False))
+        self._file_com_src_var = tk.BooleanVar(value=_cfg.get("file_combined_src",  True))
+
+        # ── Live-view (on-screen transcript panes) options ────────────────────
+        self._view_ts_var      = tk.BooleanVar(value=_cfg.get("view_ts",            True))
+        self._view_lang_var    = tk.BooleanVar(value=_cfg.get("view_lang",           False))
+
         self._model_var = tk.StringVar(value=_cfg.get("model", DEFAULT_MODEL_LABEL))
         self._processor_var = tk.StringVar(value=_cfg.get("processor", "Auto"))
 
@@ -159,36 +170,21 @@ class App(tk.Tk):
         self._proc_combo.grid(row=0, column=5, padx=(4, 12), sticky=tk.W)
         self._proc_combo.bind("<<ComboboxSelected>>", lambda _: self._save_config())
 
-        # Options dropdown (Timestamps in file + Always on top)
+        # Options dropdown
         self._ontop_var = tk.BooleanVar(value=False)
         options_btn = tk.Menubutton(
             ctrl, text="Options ▾", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
             font=("Segoe UI", 10), padx=10, pady=4, cursor="hand2",
             activebackground="#3e3e5e", activeforeground=FG
         )
-        options_menu = tk.Menu(
+        self._options_menu = tk.Menu(
             options_btn, tearoff=0, bg=ENTRY_BG, fg=FG,
             activebackground="#3e3e5e", activeforeground=FG,
             selectcolor=FG
         )
-        options_menu.add_checkbutton(
-            label="Timestamps in file", variable=self._ts_in_output_var,
-            command=self._save_config
-        )
-        options_menu.add_checkbutton(
-            label="Language tag in transcript", variable=self._show_lang_tag_var,
-            command=self._save_config
-        )
-        options_menu.add_checkbutton(
-            label="Info tags in file  ([ru], {S1}\u2026)", variable=self._info_tags_in_file_var,
-            command=self._save_config
-        )
-        options_menu.add_checkbutton(
-            label="Always on top", variable=self._ontop_var,
-            command=self._toggle_ontop
-        )
-        options_btn["menu"] = options_menu
+        options_btn["menu"] = self._options_menu
         options_btn.grid(row=0, column=6, padx=(0, 12), sticky=tk.W)
+        self._rebuild_options_menu()
 
         # Start / Stop button
         self._toggle_btn = tk.Button(
@@ -469,6 +465,68 @@ class App(tk.Tk):
 
         self._rebuild_sources_menu()
 
+    def _rebuild_options_menu(self):
+        """Rebuild the Options dropdown.
+
+        Options ▾
+          Transcripts ►         (output files)
+            Source 1 ►
+              ✓ Timestamps
+              ✓ Language tag  ([ru])
+            Source 2 ►          (only when S2 active)
+              ✓ Timestamps
+              ✓ Language tag  ([ru])
+            Combined ►
+              ✓ Timestamps
+              ✓ Language tag  ([ru])
+              ✓ Source tag    ({S1}, {S2})
+          Live View ►           (on-screen panes — applies to both S1 and S2)
+            ✓ Timestamps
+            ✓ Language tag  ([ru])
+          ─────────────────────
+          Always on top
+        """
+        menu = self._options_menu
+        menu.delete(0, "end")
+
+        sub_kw = dict(tearoff=0, bg=ENTRY_BG, fg=FG,
+                      activebackground="#3e3e5e", activeforeground=FG,
+                      selectcolor=FG)
+
+        # ── Transcripts cascade ───────────────────────────────────────────────
+        transcripts_menu = tk.Menu(menu, **sub_kw)
+
+        # Source 1 sub-cascade
+        sub_s1 = tk.Menu(transcripts_menu, **sub_kw)
+        sub_s1.add_checkbutton(label="Timestamps",       variable=self._file_s1_ts_var,   command=self._save_config)
+        sub_s1.add_checkbutton(label="Language tag ([ru])", variable=self._file_s1_lang_var, command=self._save_config)
+        transcripts_menu.add_cascade(label="Source 1", menu=sub_s1)
+
+        # Source 2 sub-cascade (only when S2 is active)
+        if self._s2_device:
+            sub_s2 = tk.Menu(transcripts_menu, **sub_kw)
+            sub_s2.add_checkbutton(label="Timestamps",          variable=self._file_s2_ts_var,   command=self._save_config)
+            sub_s2.add_checkbutton(label="Language tag ([ru])", variable=self._file_s2_lang_var, command=self._save_config)
+            transcripts_menu.add_cascade(label="Source 2", menu=sub_s2)
+
+        # Combined sub-cascade
+        sub_com = tk.Menu(transcripts_menu, **sub_kw)
+        sub_com.add_checkbutton(label="Timestamps",          variable=self._file_com_ts_var,   command=self._save_config)
+        sub_com.add_checkbutton(label="Language tag ([ru])", variable=self._file_com_lang_var, command=self._save_config)
+        sub_com.add_checkbutton(label="Source tag ({S1}, {S2})", variable=self._file_com_src_var, command=self._save_config)
+        transcripts_menu.add_cascade(label="Combined", menu=sub_com)
+
+        menu.add_cascade(label="Transcripts \u25ba", menu=transcripts_menu)
+
+        # ── Live View cascade ─────────────────────────────────────────────────
+        live_menu = tk.Menu(menu, **sub_kw)
+        live_menu.add_checkbutton(label="Timestamps",          variable=self._view_ts_var,   command=self._save_config)
+        live_menu.add_checkbutton(label="Language tag ([ru])", variable=self._view_lang_var, command=self._save_config)
+        menu.add_cascade(label="Live View \u25ba", menu=live_menu)
+
+        menu.add_separator()
+        menu.add_checkbutton(label="Always on top", variable=self._ontop_var, command=self._toggle_ontop)
+
     def _rebuild_sources_menu(self):
         """Rebuild the Sources dropdown as a two-entry cascade tree.
 
@@ -543,6 +601,7 @@ class App(tk.Tk):
 
         self._save_config()
         self._rebuild_sources_menu()
+        self._rebuild_options_menu()
         self._rebuild_transcript_panes()
         self._rebuild_meter_panel()
 
@@ -787,17 +846,22 @@ class App(tk.Tk):
     def _append_result(self, timestamp: str, text: str, language: str, source_id: int = 1):
         widget = self._text if (source_id == 1 or self._text_s2 is None) else self._text_s2
         widget.config(state=tk.NORMAL)
-        widget.insert(tk.END, f"[{timestamp}] ", "ts")
-        if self._show_lang_tag_var.get():
+        if self._view_ts_var.get():
+            widget.insert(tk.END, f"[{timestamp}] ", "ts")
+        if self._view_lang_var.get():
             widget.insert(tk.END, f"[{language}] ", "lang")
         widget.insert(tk.END, f"{text}\n", "txt")
         widget.see(tk.END)
         widget.config(state=tk.DISABLED)
 
-        lang_prefix = f"[{language}] " if self._info_tags_in_file_var.get() else ""
+        # ── Source 1 / Source 2 individual files ─────────────────────────────
+        if source_id == 1:
+            ts_flag, lang_flag = self._file_s1_ts_var.get(), self._file_s1_lang_var.get()
+        else:
+            ts_flag, lang_flag = self._file_s2_ts_var.get(), self._file_s2_lang_var.get()
+        lang_prefix = f"[{language}] " if lang_flag else ""
         line = f"{lang_prefix}{text}"
-        ts_line = f"[{timestamp}] {line}" if self._ts_in_output_var.get() else line
-        src_tag = "{S1}" if source_id == 1 else "{S2}"
+        ts_line = f"[{timestamp}] {line}" if ts_flag else line
 
         if source_id == 1:
             self._output_lines.append(ts_line)
@@ -806,7 +870,12 @@ class App(tk.Tk):
             self._s2_output_lines.append(ts_line)
             self._write_source_file(self._s2_output_file, self._s2_output_lines)
 
-        combined_line = f"{src_tag} {ts_line}" if self._info_tags_in_file_var.get() else ts_line
+        # ── Combined file ─────────────────────────────────────────────────────
+        com_lang_prefix = f"[{language}] " if self._file_com_lang_var.get() else ""
+        com_line = f"{com_lang_prefix}{text}"
+        com_ts_line = f"[{timestamp}] {com_line}" if self._file_com_ts_var.get() else com_line
+        src_tag = "{S1}" if source_id == 1 else "{S2}"
+        combined_line = f"{src_tag} {com_ts_line}" if self._file_com_src_var.get() else com_ts_line
         self._combined_output_lines.append(combined_line)
         self._write_source_file(self._combined_output_file, self._combined_output_lines)
 
@@ -988,9 +1057,15 @@ class App(tk.Tk):
             data["s2_device"] = self._s2_device
             data["s2_threshold"] = round(self._s2_threshold_var.get(), 4)
             data["s2_end_silence_ms"] = self._s2_silence_var.get()
-            data["ts_in_output"] = self._ts_in_output_var.get()
-            data["show_lang_tag"] = self._show_lang_tag_var.get()
-            data["info_tags_in_file"] = self._info_tags_in_file_var.get()
+            data["file_s1_ts"]       = self._file_s1_ts_var.get()
+            data["file_s1_lang"]     = self._file_s1_lang_var.get()
+            data["file_s2_ts"]       = self._file_s2_ts_var.get()
+            data["file_s2_lang"]     = self._file_s2_lang_var.get()
+            data["file_combined_ts"] = self._file_com_ts_var.get()
+            data["file_combined_lang"]= self._file_com_lang_var.get()
+            data["file_combined_src"]= self._file_com_src_var.get()
+            data["view_ts"]          = self._view_ts_var.get()
+            data["view_lang"]        = self._view_lang_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:
