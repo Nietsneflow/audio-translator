@@ -7,16 +7,38 @@ echo   Audio Translator — Check for Updates
 echo =============================================
 echo.
 
-:: Check git is installed
+:: Check git is installed — auto-install via winget if missing
 where git >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Git is not installed or not in PATH.
+    echo Git is not installed. Attempting automatic installation...
     echo.
-    echo Please download and install Git from:
-    echo   https://git-scm.com/download/win
+    winget --version >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Could not auto-install Git ^(winget not available^).
+        echo.
+        echo Please download and install Git manually from:
+        echo   https://git-scm.com/download/win
+        echo.
+        echo After installing, close this window and run Update.bat again.
+        goto :done
+    )
+    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements
+    if errorlevel 1 (
+        echo ERROR: Git installation failed.
+        echo.
+        echo Please download and install Git manually from:
+        echo   https://git-scm.com/download/win
+        echo.
+        echo After installing, close this window and run Update.bat again.
+        goto :done
+    )
+    :: Refresh PATH so git is available in this session
+    for /f "tokens=*" %%i in ('where /r "%ProgramFiles%\Git" git.exe 2^>nul') do set "GIT_EXE=%%i"
+    if defined GIT_EXE (
+        for %%d in ("%GIT_EXE%") do set "PATH=%%~dpd;%PATH%"
+    )
+    echo Git installed successfully.
     echo.
-    echo After installing, close this window and run Update.bat again.
-    goto :done
 )
 
 :: Check this folder is a git repository
