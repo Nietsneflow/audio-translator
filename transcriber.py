@@ -5,6 +5,7 @@ faster-whisper translation (Russian → English), and fires a
 callback on the main thread with the result text.
 """
 
+import ctypes
 import os
 import sys
 import threading
@@ -155,7 +156,6 @@ class TranscriberThread(threading.Thread):
         # Lower this thread's priority so Whisper inference doesn't starve
         # foreground apps (e.g. games).  THREAD_PRIORITY_BELOW_NORMAL = -1.
         try:
-            import ctypes
             ctypes.windll.kernel32.SetThreadPriority(
                 ctypes.windll.kernel32.GetCurrentThread(), -1
             )

@@ -148,5 +148,3 @@ def get_session_log_path() -> str:
 def get_logger(name: str) -> logging.Logger:
     """Return a named logger. setup_logging() must have been called first."""
     return logging.getLogger(name)
-
-    return logging.getLogger(name)

@@ -4,6 +4,8 @@ Captures system/loopback audio via Windows WASAPI and pushes
 numpy float32 chunks (16 kHz mono) into a queue for transcription.
 """
 
+import collections
+import ctypes
 import threading
 import queue
 import numpy as np
@@ -34,7 +36,6 @@ PRE_ROLL_FRAMES = int(PRE_ROLL_MS / FRAME_MS)         # 10 frames
 # utterance finished and ship it for translation.
 # This is the *base* (minimum) gate — for short utterances it may scale up.
 END_SILENCE_MS = 300
-END_SILENCE_FRAMES = int(END_SILENCE_MS / FRAME_MS)   # 10 frames
 
 # For longer utterances the silence gate scales up so a brief pause mid-sentence
 # doesn't prematurely cut off a fast speaker (e.g. Spanish).
@@ -157,7 +158,6 @@ class AudioCaptureThread(threading.Thread):
         # Lower this thread's priority so the OS always gives the game/GPU
         # driver first access to CPU time.  THREAD_PRIORITY_BELOW_NORMAL = -1.
         try:
-            import ctypes
             ctypes.windll.kernel32.SetThreadPriority(
                 ctypes.windll.kernel32.GetCurrentThread(), -1
             )
@@ -176,7 +176,6 @@ class AudioCaptureThread(threading.Thread):
         raw_buf = np.empty(0, dtype=np.float32)
 
         # VAD state machine
-        import collections
         state = _SILENT
         pre_roll = collections.deque(maxlen=PRE_ROLL_FRAMES)  # ring buffer
         utterance_frames: list[np.ndarray] = []

@@ -554,7 +554,7 @@ class App(tk.Tk):
         if not self._s1_device:
             return
         log.info("Restarting capture — S1=%r S2=%r", self._s1_device, self._s2_device)
-        self._set_status(f"Switching sources…")
+        self._set_status("Switching sources…")
 
         if self._capture_thread:
             self._capture_thread.stop()
