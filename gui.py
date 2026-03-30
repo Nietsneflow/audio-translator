@@ -172,18 +172,18 @@ class App(tk.Tk):
 
         # Options dropdown
         self._ontop_var = tk.BooleanVar(value=False)
-        options_btn = tk.Menubutton(
+        self._options_btn = tk.Menubutton(
             ctrl, text="Options ▾", bg=ENTRY_BG, fg=FG, relief=tk.FLAT,
             font=("Segoe UI", 10), padx=10, pady=4, cursor="hand2",
             activebackground="#3e3e5e", activeforeground=FG
         )
         self._options_menu = tk.Menu(
-            options_btn, tearoff=0, bg=ENTRY_BG, fg=FG,
+            self._options_btn, tearoff=0, bg=ENTRY_BG, fg=FG,
             activebackground="#3e3e5e", activeforeground=FG,
             selectcolor=FG
         )
-        options_btn["menu"] = self._options_menu
-        options_btn.grid(row=0, column=6, padx=(0, 12), sticky=tk.W)
+        self._options_btn["menu"] = self._options_menu
+        self._options_btn.grid(row=0, column=6, padx=(0, 12), sticky=tk.W)
         self._rebuild_options_menu()
 
         # Start / Stop button
@@ -498,30 +498,30 @@ class App(tk.Tk):
 
         # Source 1 sub-cascade
         sub_s1 = tk.Menu(transcripts_menu, **sub_kw)
-        sub_s1.add_checkbutton(label="Timestamps",       variable=self._file_s1_ts_var,   command=self._save_config)
-        sub_s1.add_checkbutton(label="Language tag ([ru])", variable=self._file_s1_lang_var, command=self._save_config)
+        sub_s1.add_checkbutton(label="Timestamps",          variable=self._file_s1_ts_var,   command=self._save_repost)
+        sub_s1.add_checkbutton(label="Language tag ([ru])", variable=self._file_s1_lang_var, command=self._save_repost)
         transcripts_menu.add_cascade(label="Source 1", menu=sub_s1)
 
         # Source 2 sub-cascade (only when S2 is active)
         if self._s2_device:
             sub_s2 = tk.Menu(transcripts_menu, **sub_kw)
-            sub_s2.add_checkbutton(label="Timestamps",          variable=self._file_s2_ts_var,   command=self._save_config)
-            sub_s2.add_checkbutton(label="Language tag ([ru])", variable=self._file_s2_lang_var, command=self._save_config)
+            sub_s2.add_checkbutton(label="Timestamps",          variable=self._file_s2_ts_var,   command=self._save_repost)
+            sub_s2.add_checkbutton(label="Language tag ([ru])", variable=self._file_s2_lang_var, command=self._save_repost)
             transcripts_menu.add_cascade(label="Source 2", menu=sub_s2)
 
         # Combined sub-cascade
         sub_com = tk.Menu(transcripts_menu, **sub_kw)
-        sub_com.add_checkbutton(label="Timestamps",          variable=self._file_com_ts_var,   command=self._save_config)
-        sub_com.add_checkbutton(label="Language tag ([ru])", variable=self._file_com_lang_var, command=self._save_config)
-        sub_com.add_checkbutton(label="Source tag ({S1}, {S2})", variable=self._file_com_src_var, command=self._save_config)
+        sub_com.add_checkbutton(label="Timestamps",              variable=self._file_com_ts_var,  command=self._save_repost)
+        sub_com.add_checkbutton(label="Language tag ([ru])",     variable=self._file_com_lang_var,command=self._save_repost)
+        sub_com.add_checkbutton(label="Source tag ({S1}, {S2})", variable=self._file_com_src_var, command=self._save_repost)
         transcripts_menu.add_cascade(label="Combined", menu=sub_com)
 
         menu.add_cascade(label="Transcripts \u25ba", menu=transcripts_menu)
 
         # ── Live View cascade ─────────────────────────────────────────────────
         live_menu = tk.Menu(menu, **sub_kw)
-        live_menu.add_checkbutton(label="Timestamps",          variable=self._view_ts_var,   command=self._save_config)
-        live_menu.add_checkbutton(label="Language tag ([ru])", variable=self._view_lang_var, command=self._save_config)
+        live_menu.add_checkbutton(label="Timestamps",          variable=self._view_ts_var,   command=self._save_repost)
+        live_menu.add_checkbutton(label="Language tag ([ru])", variable=self._view_lang_var, command=self._save_repost)
         menu.add_cascade(label="Live View \u25ba", menu=live_menu)
 
         menu.add_separator()
@@ -1045,6 +1045,13 @@ class App(tk.Tk):
                 return json.load(f)
         except (OSError, json.JSONDecodeError):
             return {}
+
+    def _save_repost(self):
+        """Save config then re-post the Options menu so it stays visible."""
+        self._save_config()
+        x = self._options_btn.winfo_rootx()
+        y = self._options_btn.winfo_rooty() + self._options_btn.winfo_height()
+        self.after(1, lambda: self._options_menu.post(x, y))
 
     def _save_config(self):
         try:
