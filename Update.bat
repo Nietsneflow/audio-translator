@@ -1,10 +1,19 @@
 @echo off
+:: ── Re-run through PowerShell Tee so all output goes to both ──
+:: ── the console AND install_log.txt                           ──
+if "%1"=="--logged" goto :main
+powershell -NoProfile -ExecutionPolicy Bypass -Command "cmd /c '%~f0 --logged' 2>&1 | Tee-Object -FilePath '%~dp0install_log.txt'"
+exit /b %ERRORLEVEL%
+
+:main
 title Audio Translator — Update
 cd /d "%~dp0"
 
 echo =============================================
-echo   Audio Translator — Check for Updates
+echo   Audio Translator — Update
 echo =============================================
+echo Started: %DATE% %TIME%
+echo Log file: %~dp0install_log.txt
 echo.
 
 :: Check git is installed — auto-install via winget if missing
