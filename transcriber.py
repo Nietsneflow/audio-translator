@@ -316,10 +316,6 @@ class TranscriberThread(threading.Thread):
 
         utterance_seq = 0
         SAMPLE_RATE = 16_000
-        # Maximum utterances to keep when the queue has backed up.
-        # Any older items are dropped — they are stale and translating them
-        # all at once would cause a second GPU spike after the game frees up.
-        MAX_QUEUED_UTTERANCES = 3
         SILENCE_GAP = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
 
         while not self._stop_event.is_set():
@@ -342,10 +338,6 @@ class TranscriberThread(threading.Thread):
                 continue
             if tag != "audio":
                 continue
-            # Drain everything waiting behind the utterance we just pulled.
-            # If more than MAX_QUEUED_UTTERANCES are waiting (queue backed up
-            # while GPU was busy with game), discard the oldest so we don't
-            # translate a pile of stale audio and cause a second GPU spike.
             queued_audio: list = []  # list of (audio_data, source_id)
             while True:
                 try:
@@ -364,12 +356,6 @@ class TranscriberThread(threading.Thread):
                 if next_tag == "audio":
                     queued_audio.append((next_payload, next_src))
                 # status tags discarded (stale by now)
-
-            if len(queued_audio) > MAX_QUEUED_UTTERANCES:
-                dropped = len(queued_audio) - MAX_QUEUED_UTTERANCES
-                log.warning("Queue backed up — dropping %d stale utterance(s)", dropped)
-                self.on_status(f"Dropped {dropped} stale utterance(s) to keep up…")
-                queued_audio = queued_audio[-MAX_QUEUED_UTTERANCES:]
 
             # audio_parts is list of (audio_data, source_id)
             # Only batch items from the same source to avoid cross-source merging.
