@@ -25,3 +25,6 @@ models/**/model.bin
 
 # VS Code
 .vscode/
+
+# Build output
+Install/
