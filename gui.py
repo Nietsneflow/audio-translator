@@ -749,7 +749,7 @@ class App(tk.Tk):
             installed = _pkg.get_installed_packages()
             if any(p.from_code == "en" and p.to_code == "ru" for p in installed):
                 self._translator_ready = True
-                self.after(0, self._set_status, "Translation ready — listening…")
+                self.after(0, self._set_status, "Translation ready — press Start to begin.")
             else:
                 log.warning("argostranslate en→ru package not found")
                 self.after(0, self._revert_translate_flags)
