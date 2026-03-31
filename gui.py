@@ -107,22 +107,25 @@ class App(tk.Tk):
         self._file_com_lang_var= tk.BooleanVar(value=_cfg.get("file_combined_lang",  False))
         self._file_com_src_var = tk.BooleanVar(value=_cfg.get("file_combined_src",  True))
 
-        # ── Live-view (on-screen transcript panes) options ────────────────────
-        self._view_ts_var      = tk.BooleanVar(value=_cfg.get("view_ts",            True))
-        self._view_lang_var    = tk.BooleanVar(value=_cfg.get("view_lang",           False))
+        # ── Live-view (on-screen transcript panes) options — per source ─────────
+        self._view_s1_ts_var         = tk.BooleanVar(value=_cfg.get("view_s1_ts",        _cfg.get("view_ts",   True)))
+        self._view_s1_lang_var       = tk.BooleanVar(value=_cfg.get("view_s1_lang",       _cfg.get("view_lang", False)))
+        self._view_s2_ts_var         = tk.BooleanVar(value=_cfg.get("view_s2_ts",        _cfg.get("view_ts",   True)))
+        self._view_s2_lang_var       = tk.BooleanVar(value=_cfg.get("view_s2_lang",       _cfg.get("view_lang", False)))
 
         # ── Translation (per-output) ──────────────────────────────────────────
         self._file_s1_translate_var  = tk.BooleanVar(value=_cfg.get("file_s1_translate",  False))
         self._file_s2_translate_var  = tk.BooleanVar(value=_cfg.get("file_s2_translate",  False))
         self._file_com_translate_var = tk.BooleanVar(value=_cfg.get("file_com_translate",  False))
-        self._view_translate_var     = tk.BooleanVar(value=_cfg.get("view_translate",      False))
+        self._view_s1_translate_var  = tk.BooleanVar(value=_cfg.get("view_s1_translate",  _cfg.get("view_translate", False)))
+        self._view_s2_translate_var  = tk.BooleanVar(value=_cfg.get("view_s2_translate",  False))
         # argostranslate: True once the en→ru language pack is confirmed present.
         self._translator_ready = False
         self._translator_loading = False
         # Pre-verify if any translate flag was saved as True
         if any(v.get() for v in (
             self._file_s1_translate_var, self._file_s2_translate_var,
-            self._file_com_translate_var, self._view_translate_var,
+            self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var,
         )):
             threading.Thread(target=self._load_translator_bg, daemon=True).start()
 
@@ -495,9 +498,17 @@ class App(tk.Tk):
               ✓ Timestamps
               ✓ Language tag  ([ru])
               ✓ Source tag    ({S1}, {S2})
-          Live View ►           (on-screen panes — applies to both S1 and S2)
-            ✓ Timestamps
-            ✓ Language tag  ([ru])
+          Live View ►           (on-screen panes)
+            Source 1 ►          (or flat when S2 inactive)
+              ✓ Timestamps
+              ✓ Language tag  ([ru])
+              ─────────────────────
+              Translate English → Russian
+            Source 2 ►          (only when S2 active)
+              ✓ Timestamps
+              ✓ Language tag  ([ru])
+              ─────────────────────
+              Translate English → Russian
           ─────────────────────
           Always on top
         """
@@ -541,10 +552,24 @@ class App(tk.Tk):
 
         # ── Live View cascade ─────────────────────────────────────────────────
         live_menu = tk.Menu(menu, **sub_kw)
-        live_menu.add_checkbutton(label="Timestamps",               variable=self._view_ts_var,          command=self._save_repost)
-        live_menu.add_checkbutton(label="Language tag ([ru])",      variable=self._view_lang_var,        command=self._save_repost)
-        live_menu.add_separator()
-        live_menu.add_checkbutton(label="Translate English \u2192 Russian", variable=self._view_translate_var, command=self._on_translate_toggle)
+        if self._s2_device:
+            live_s1 = tk.Menu(live_menu, **sub_kw)
+            live_s1.add_checkbutton(label="Timestamps",               variable=self._view_s1_ts_var,       command=self._save_repost)
+            live_s1.add_checkbutton(label="Language tag ([ru])",      variable=self._view_s1_lang_var,     command=self._save_repost)
+            live_s1.add_separator()
+            live_s1.add_checkbutton(label="Translate English \u2192 Russian", variable=self._view_s1_translate_var, command=self._on_translate_toggle)
+            live_menu.add_cascade(label="Source 1", menu=live_s1)
+            live_s2 = tk.Menu(live_menu, **sub_kw)
+            live_s2.add_checkbutton(label="Timestamps",               variable=self._view_s2_ts_var,       command=self._save_repost)
+            live_s2.add_checkbutton(label="Language tag ([ru])",      variable=self._view_s2_lang_var,     command=self._save_repost)
+            live_s2.add_separator()
+            live_s2.add_checkbutton(label="Translate English \u2192 Russian", variable=self._view_s2_translate_var, command=self._on_translate_toggle)
+            live_menu.add_cascade(label="Source 2", menu=live_s2)
+        else:
+            live_menu.add_checkbutton(label="Timestamps",               variable=self._view_s1_ts_var,       command=self._save_repost)
+            live_menu.add_checkbutton(label="Language tag ([ru])",      variable=self._view_s1_lang_var,     command=self._save_repost)
+            live_menu.add_separator()
+            live_menu.add_checkbutton(label="Translate English \u2192 Russian", variable=self._view_s1_translate_var, command=self._on_translate_toggle)
         menu.add_cascade(label="Live View \u25ba", menu=live_menu)
 
         menu.add_separator()
@@ -686,7 +711,7 @@ class App(tk.Tk):
         """
         any_on = any(v.get() for v in (
             self._file_s1_translate_var, self._file_s2_translate_var,
-            self._file_com_translate_var, self._view_translate_var,
+            self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var,
         ))
         if any_on and not self._translator_ready and not self._translator_loading:
             # Check whether argostranslate + en→ru pack are installed.
@@ -699,7 +724,7 @@ class App(tk.Tk):
 
             if not pkg_ok:
                 for v in (self._file_s1_translate_var, self._file_s2_translate_var,
-                          self._file_com_translate_var, self._view_translate_var):
+                          self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var):
                     v.set(False)
                 messagebox.showinfo(
                     "Translation package not ready",
@@ -737,7 +762,7 @@ class App(tk.Tk):
 
     def _revert_translate_flags(self):
         for v in (self._file_s1_translate_var, self._file_s2_translate_var,
-                  self._file_com_translate_var, self._view_translate_var):
+                  self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var):
             v.set(False)
         self._save_config()
 
@@ -962,16 +987,33 @@ class App(tk.Tk):
             return text, language
 
         # ── Live view pane ────────────────────────────────────────────────────
-        view_text, view_lang = _get_text_for(self._view_translate_var.get())
+        if source_id == 1:
+            view_tr_flag   = self._view_s1_translate_var.get()
+            view_ts_flag   = self._view_s1_ts_var.get()
+            view_lang_flag = self._view_s1_lang_var.get()
+        else:
+            view_tr_flag   = self._view_s2_translate_var.get()
+            view_ts_flag   = self._view_s2_ts_var.get()
+            view_lang_flag = self._view_s2_lang_var.get()
+        view_text, view_lang = _get_text_for(view_tr_flag)
         widget = self._text if (source_id == 1 or self._text_s2 is None) else self._text_s2
         widget.config(state=tk.NORMAL)
-        if self._view_ts_var.get():
+        if view_ts_flag:
             widget.insert(tk.END, f"[{timestamp}] ", "ts")
-        if self._view_lang_var.get():
+        if view_lang_flag:
             widget.insert(tk.END, f"[{view_lang}] ", "lang")
         widget.insert(tk.END, f"{view_text}\n", "txt")
         widget.see(tk.END)
         widget.config(state=tk.DISABLED)
+
+        src_label = "S1" if source_id == 1 else "S2"
+        console_parts = [f"[{src_label}]"]
+        if view_ts_flag:
+            console_parts.append(f"[{timestamp}]")
+        if view_lang_flag:
+            console_parts.append(f"[{view_lang}]")
+        console_parts.append(view_text)
+        print(" ".join(console_parts), flush=True)
 
         # ── Source 1 / Source 2 individual files ─────────────────────────────
         if source_id == 1:
@@ -1196,12 +1238,15 @@ class App(tk.Tk):
             data["file_combined_ts"] = self._file_com_ts_var.get()
             data["file_combined_lang"]= self._file_com_lang_var.get()
             data["file_combined_src"]= self._file_com_src_var.get()
-            data["view_ts"]             = self._view_ts_var.get()
-            data["view_lang"]           = self._view_lang_var.get()
+            data["view_s1_ts"]          = self._view_s1_ts_var.get()
+            data["view_s1_lang"]        = self._view_s1_lang_var.get()
+            data["view_s2_ts"]          = self._view_s2_ts_var.get()
+            data["view_s2_lang"]        = self._view_s2_lang_var.get()
             data["file_s1_translate"]   = self._file_s1_translate_var.get()
             data["file_s2_translate"]   = self._file_s2_translate_var.get()
             data["file_com_translate"]  = self._file_com_translate_var.get()
-            data["view_translate"]      = self._view_translate_var.get()
+            data["view_s1_translate"]   = self._view_s1_translate_var.get()
+            data["view_s2_translate"]   = self._view_s2_translate_var.get()
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except OSError as exc:
