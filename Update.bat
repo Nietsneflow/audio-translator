@@ -74,7 +74,7 @@ if errorlevel 1 (
 :: Pull latest changes
 echo Checking for updates...
 echo.
-git pull
+git pull origin main
 if errorlevel 1 (
     echo.
     echo Update failed. Check the error above.
