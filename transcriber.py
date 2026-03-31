@@ -317,6 +317,12 @@ class TranscriberThread(threading.Thread):
         utterance_seq = 0
         SAMPLE_RATE = 16_000
         SILENCE_GAP = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+        # Whisper's context window is 30 seconds of audio.  When multiple
+        # queued utterances are batched together, stop merging once the
+        # concatenated audio (including 0.5 s silence gaps) would exceed this.
+        # Anything over the cap starts a new inference call rather than being
+        # silently truncated by Whisper.
+        WHISPER_MAX_MERGE_SAMPLES = int(SAMPLE_RATE * 25)  # 25 s — safe headroom
 
         while not self._stop_event.is_set():
             try:
@@ -378,13 +384,79 @@ class TranscriberThread(threading.Thread):
                 if len(grp_parts) == 1:
                     audio_data = grp_parts[0]
                 else:
-                    interleaved = []
-                    for i, part in enumerate(grp_parts):
-                        interleaved.append(part)
-                        if i < len(grp_parts) - 1:
-                            interleaved.append(SILENCE_GAP)
-                    audio_data = np.concatenate(interleaved)
+                    # Merge consecutive chunks up to WHISPER_MAX_MERGE_SAMPLES.
+                    # When a chunk would push the batch over the limit, flush the
+                    # current batch as its own inference and start a new one.
+                    # This keeps all audio — nothing is dropped — while ensuring
+                    # no single Whisper call ever exceeds its 30 s context window.
+                    batches: list[list] = [[]]
+                    running_samples = 0
+                    gap_samples = len(SILENCE_GAP)
+                    for part in grp_parts:
+                        chunk_samples = len(part)
+                        needed = chunk_samples + (gap_samples if batches[-1] else 0)
+                        if batches[-1] and running_samples + needed > WHISPER_MAX_MERGE_SAMPLES:
+                            # Start a fresh batch for this chunk
+                            batches.append([])
+                            running_samples = 0
+                        batches[-1].append(part)
+                        running_samples += chunk_samples + (gap_samples if len(batches[-1]) > 1 else 0)
 
+                    for batch in batches:
+                        if len(batch) == 1:
+                            merged = batch[0]
+                        else:
+                            interleaved = []
+                            for i, part in enumerate(batch):
+                                interleaved.append(part)
+                                if i < len(batch) - 1:
+                                    interleaved.append(SILENCE_GAP)
+                            merged = np.concatenate(interleaved)
+                        # Use the merged array as the audio_data for this batch
+                        # by appending it back; the single-chunk path below will
+                        # pick it up.  For simplicity we just reassign and fall
+                        # through — but we need to handle multi-batch groups inline.
+                        batch_duration = len(merged) / SAMPLE_RATE
+                        log.debug("Transcribing %s src=%d (%.2f s, batch of %d)",
+                                  seq_label, grp_src, batch_duration, len(batch))
+                        self.on_status(f"Translating {seq_label} ({batch_duration:.1f}s)…")
+                        try:
+                            segments, info = model.transcribe(
+                                merged,
+                                task="translate",
+                                beam_size=1,
+                                temperature=0.0,
+                                log_prob_threshold=None,
+                                no_speech_threshold=0.6,
+                                condition_on_previous_text=False,
+                                without_timestamps=True,
+                                vad_filter=True,
+                                vad_parameters={"min_silence_duration_ms": 300},
+                                repetition_penalty=1.3,
+                            )
+                            log.debug("%s — language=%s (prob=%.2f)",
+                                      seq_label, info.language, info.language_probability)
+                            for segment in segments:
+                                text = segment.text.strip()
+                                if not text:
+                                    continue
+                                if _is_repetition_loop(text):
+                                    continue
+                                if _is_phantom(text,
+                                               getattr(segment, "no_speech_prob", 0.0),
+                                               getattr(segment, "avg_logprob", 0.0)):
+                                    continue
+                                ts = time.strftime("%H:%M:%S")
+                                log.info("[%s] %s %s", ts, seq_label, text)
+                                self.on_result(ts, text, info.language, grp_src)
+                            self.on_status("Listening…")
+                            time.sleep(0.15)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("Batch transcription error: %s", exc)
+                            self.on_status("Listening…")
+                    continue  # skip the single-chunk path below for multi-part groups
+
+                audio_data = grp_parts[0]  # single-chunk groups fall through to here
                 duration = len(audio_data) / SAMPLE_RATE
                 try:
                     log.debug("Transcribing %s src=%d (%.2f s)", seq_label, grp_src, duration)
