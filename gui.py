@@ -33,6 +33,31 @@ from transcriber import TranscriberThread, MODEL_OPTIONS, DEFAULT_MODEL_LABEL
 
 log = get_logger(__name__)
 
+
+class _AudioQueue(queue.Queue):
+    """Queue that tracks how many *audio* items it currently holds, so the
+    GUI depth indicator doesn't count transient status/error tuples.
+
+    The _put/_get hooks run while Queue's internal mutex is held, so the
+    counter stays consistent across threads.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.audio_depth = 0
+
+    def _put(self, item):
+        if item and item[0] == "audio":
+            self.audio_depth += 1
+        super()._put(item)
+
+    def _get(self):
+        item = super()._get()
+        if item and item[0] == "audio":
+            self.audio_depth -= 1
+        return item
+
+
 # ─── colour scheme ────────────────────────────────────────────────────────────
 BG = "#1e1e2e"
 FG = "#cdd6f4"
@@ -52,12 +77,15 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.minsize(640, 420)
 
-        self._audio_queue: queue.Queue = queue.Queue()  # unbounded — capture never blocks
+        self._audio_queue: _AudioQueue = _AudioQueue()  # unbounded — capture never blocks
         self._capture_thread: AudioCaptureThread | None = None
         self._capture_thread_s2: AudioCaptureThread | None = None
         self._transcriber_thread: TranscriberThread | None = None
         self._running = False
+        self._closing = False  # set in _on_close; gates late worker callbacks
         self._poll_id: str | None = None  # after() handle for queue-depth polling
+        self._save_after_id: str | None = None  # debounce handle for slider saves
+        self._start_wait_count = 0  # deferred-start ticks while old model unloads
         self._stats_stop = threading.Event()  # signals the stats thread to exit
         self._output_lines: collections.deque = collections.deque(maxlen=20)
         self._s2_output_lines: collections.deque = collections.deque(maxlen=20)
@@ -77,17 +105,26 @@ class App(tk.Tk):
 
         _cfg = self._load_config()
 
-        saved_threshold = _cfg.get("threshold", SPEECH_THRESHOLD)
+        def _cfg_num(key: str, default, cast):
+            """Read a numeric config value; a hand-edited bad type falls back
+            to the default instead of crashing startup."""
+            try:
+                return cast(_cfg.get(key, default))
+            except (TypeError, ValueError):
+                log.warning("Ignoring invalid config value for %r: %r", key, _cfg.get(key))
+                return default
+
+        saved_threshold = _cfg_num("threshold", SPEECH_THRESHOLD, float)
         self._threshold_var = tk.DoubleVar(value=saved_threshold)
         self._threshold_display_var = tk.StringVar(value=f"{saved_threshold:.3f}")
-        saved_silence = int(_cfg.get("end_silence_ms", END_SILENCE_MS))
+        saved_silence = _cfg_num("end_silence_ms", END_SILENCE_MS, int)
         self._silence_var = tk.IntVar(value=saved_silence)
         self._silence_display_var = tk.StringVar(value=f"{saved_silence} ms")
 
-        s2_thresh = _cfg.get("s2_threshold", SPEECH_THRESHOLD)
+        s2_thresh = _cfg_num("s2_threshold", SPEECH_THRESHOLD, float)
         self._s2_threshold_var = tk.DoubleVar(value=s2_thresh)
         self._s2_threshold_display_var = tk.StringVar(value=f"{s2_thresh:.3f}")
-        s2_sil = int(_cfg.get("s2_end_silence_ms", END_SILENCE_MS))
+        s2_sil = _cfg_num("s2_end_silence_ms", END_SILENCE_MS, int)
         self._s2_silence_var = tk.IntVar(value=s2_sil)
         self._s2_silence_display_var = tk.StringVar(value=f"{s2_sil} ms")
 
@@ -97,6 +134,9 @@ class App(tk.Tk):
 
         self._s1_device = _cfg.get("s1_device", _cfg.get("device", None))
         self._s2_device = _cfg.get("s2_device", None)  # None = disabled
+        if self._s2_device and self._s2_device == self._s1_device:
+            log.warning("Config had S1 == S2 (%r) — disabling S2", self._s2_device)
+            self._s2_device = None
 
         # ── Per-file output options ───────────────────────────────────────────
         self._file_s1_ts_var   = tk.BooleanVar(value=_cfg.get("file_s1_ts",        True))
@@ -122,11 +162,15 @@ class App(tk.Tk):
         # argostranslate: True once the en→ru language pack is confirmed present.
         self._translator_ready = False
         self._translator_loading = False
-        # Pre-verify if any translate flag was saved as True
-        if any(v.get() for v in (
+        # Plain-bool mirror of "any translate flag on", readable from worker
+        # threads (tk Vars must only be touched on the main thread).
+        self._translate_enabled = any(v.get() for v in (
             self._file_s1_translate_var, self._file_s2_translate_var,
             self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var,
-        )):
+        ))
+        # Pre-verify if any translate flag was saved as True
+        if self._translate_enabled:
+            self._translator_loading = True
             threading.Thread(target=self._load_translator_bg, daemon=True).start()
 
         self._model_var = tk.StringVar(value=_cfg.get("model", DEFAULT_MODEL_LABEL))
@@ -639,8 +683,12 @@ class App(tk.Tk):
         if source_num == 1:
             if device_name and device_name == self._s1_device:
                 return  # S1 can't be disabled
+            if device_name and device_name == self._s2_device:
+                return  # already assigned to S2 — the grayed entry is informational
             self._s1_device = device_name
         else:
+            if device_name and device_name == self._s1_device:
+                return  # already assigned to S1
             # Toggle off if already selected
             if device_name == self._s2_device:
                 self._s2_device = None
@@ -668,11 +716,13 @@ class App(tk.Tk):
         if self._capture_thread_s2:
             self._capture_thread_s2.stop()
 
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Swap in a fresh queue instead of draining: an old capture thread that
+        # is mid-put can't sneak one more utterance from the old device into the
+        # new session.  The transcriber re-reads .audio_queue on every get(), so
+        # it follows over to the new queue within one poll cycle.
+        self._audio_queue = _AudioQueue()
+        if self._transcriber_thread:
+            self._transcriber_thread.audio_queue = self._audio_queue
 
         self._capture_thread = AudioCaptureThread(
             audio_queue=self._audio_queue,
@@ -713,6 +763,7 @@ class App(tk.Tk):
             self._file_s1_translate_var, self._file_s2_translate_var,
             self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var,
         ))
+        self._translate_enabled = any_on
         if any_on and not self._translator_ready and not self._translator_loading:
             # Check whether argostranslate + en→ru pack are installed.
             try:
@@ -726,6 +777,7 @@ class App(tk.Tk):
                 for v in (self._file_s1_translate_var, self._file_s2_translate_var,
                           self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var):
                     v.set(False)
+                self._translate_enabled = False
                 messagebox.showinfo(
                     "Translation package not ready",
                     "The offline English→Russian translation package has not been "
@@ -764,6 +816,7 @@ class App(tk.Tk):
         for v in (self._file_s1_translate_var, self._file_s2_translate_var,
                   self._file_com_translate_var, self._view_s1_translate_var, self._view_s2_translate_var):
             v.set(False)
+        self._translate_enabled = False
         self._save_config()
 
     def _toggle(self):
@@ -778,6 +831,15 @@ class App(tk.Tk):
         # Two simultaneous WhisperModel instances can exhaust VRAM/RAM and cause
         # a hard C++ abort in ctranslate2 with no Python traceback.
         if self._transcriber_thread and self._transcriber_thread.is_alive():
+            self._start_wait_count += 1
+            if self._start_wait_count > 100:  # ~30 s — the unload is stuck
+                self._start_wait_count = 0
+                self._toggle_btn.config(text="▶  Start", bg=BTN_START, state=tk.NORMAL)
+                self._set_status(
+                    "Previous session is still unloading after 30 s — "
+                    "try Start again, or restart the app if this persists."
+                )
+                return
             # Disable the button so a second click can't queue a parallel
             # _start() chain that would also race to load the model.
             self._toggle_btn.config(
@@ -786,6 +848,7 @@ class App(tk.Tk):
             self._set_status("Waiting for previous session to finish unloading model…")
             self.after(300, self._start)
             return
+        self._start_wait_count = 0
         # Restore normal button state (it was disabled/relabelled above).
         self._toggle_btn.config(state=tk.NORMAL)
         # If the thread just died, give it a moment for its in-thread CUDA sync
@@ -807,7 +870,7 @@ class App(tk.Tk):
 
         # Replace the queue so any still-lingering old thread can't inject
         # stale audio or stop sentinels into the new session.
-        self._audio_queue = queue.Queue()
+        self._audio_queue = _AudioQueue()
 
         self._capture_thread = AudioCaptureThread(
             audio_queue=self._audio_queue,
@@ -889,7 +952,8 @@ class App(tk.Tk):
 
     def _poll_queue_depth(self):
         """Update the right-side queue depth indicator every 400 ms."""
-        depth = self._audio_queue.qsize()
+        # audio_depth counts only utterances — not transient status tuples.
+        depth = max(0, self._audio_queue.audio_depth)
         if depth == 0:
             self._queue_var.set("● idle")
         elif depth == 1:
@@ -940,26 +1004,45 @@ class App(tk.Tk):
 
     # ── thread-safe callbacks (called from background threads) ────────────────
 
+    def _post(self, fn, *args):
+        """Marshal a call onto the Tk main thread; drop it if the window is
+        closing (a worker finishing its last utterance would otherwise raise
+        RuntimeError posting to a destroyed Tk)."""
+        if self._closing:
+            return
+        try:
+            self.after(0, fn, *args)
+        except RuntimeError:
+            pass  # window destroyed while a worker thread was finishing
+
     def _on_result(self, timestamp: str, text: str, language: str, source_id: int = 1):
-        """Called from TranscriberThread — must post to main thread via after()."""
-        self.after(0, self._append_result, timestamp, text, language, source_id)
+        """Called from TranscriberThread — must post to main thread via after().
+
+        The (slow, CPU-inference) argos translation runs HERE on the
+        transcriber thread, so the Tk event loop is never blocked by it.
+        """
+        translated = None
+        if language == "en" and self._translate_enabled:
+            translated = self._translate(text)
+        self._post(self._append_result, timestamp, text, language, source_id, translated)
 
     def _on_error(self, message: str):
-        self.after(0, self._show_error, message)
+        self._post(self._show_error, message)
 
     def _on_status(self, message: str):
-        self.after(0, self._set_status, message)
+        self._post(self._set_status, message)
 
     def _on_device_info(self, device: str, compute_type: str):
-        self.after(0, self._set_device_chip, device, compute_type)
+        self._post(self._set_device_chip, device, compute_type)
 
     # ── main-thread UI updates ────────────────────────────────────────────────
 
     def _translate(self, text: str) -> str | None:
         """Translate *text* English→Russian via argostranslate (fully offline).
 
-        Returns the Russian string on success, or None if the language pack
-        is not installed yet.
+        Runs on the transcriber thread (see _on_result) — argos inference takes
+        hundreds of ms and must never block the Tk event loop.  Returns the
+        Russian string on success, or None if the language pack is missing.
         """
         if not self._translator_ready:
             return None
@@ -970,20 +1053,16 @@ class App(tk.Tk):
             log.warning("Translation failed: %s", exc)
             return None
 
-    def _append_result(self, timestamp: str, text: str, language: str, source_id: int = 1):
-        # Pre-compute translated text once if the source language is English
-        # and at least one output has its translate flag enabled.
-        is_english = (language == "en")
-        _translated: str | None = None  # lazy — only call _translate() if needed
+    def _append_result(self, timestamp: str, text: str, language: str,
+                       source_id: int = 1, translated: str | None = None):
+        # *translated* was computed on the transcriber thread (see _on_result)
+        # so the Tk event loop never blocks on argos inference; here we only
+        # choose which outputs display it.
 
         def _get_text_for(translate_flag: bool) -> tuple[str, str]:
             """Return (display_text, display_lang) applying translation if flagged."""
-            nonlocal _translated
-            if translate_flag and is_english:
-                if _translated is None:
-                    _translated = self._translate(text)
-                if _translated is not None:
-                    return _translated, "en\u2192ru"
+            if translate_flag and translated is not None:
+                return translated, "en\u2192ru"
             return text, language
 
         # ── Live view pane ────────────────────────────────────────────────────
@@ -1047,18 +1126,27 @@ class App(tk.Tk):
         self._write_source_file(self._combined_output_file, self._combined_output_lines)
 
     def _write_source_file(self, path: str, lines):
+        """Atomically rewrite *path* with the rolling window of lines.
+
+        Write-to-temp + os.replace so OBS never reads a half-truncated file
+        (a plain open(path, "w") leaves a window where the overlay is empty).
+        """
+        tmp = path + ".tmp"
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
+            os.replace(tmp, path)
         except OSError as exc:
             log.warning("Could not write %s: %s", path, exc)
 
     def _show_error(self, message: str):
         log.error("Application error: %s", message)
         self._set_status(f"Error: {message}")
-        messagebox.showerror("Error", message)
+        # Stop BEFORE the modal dialog — otherwise capture/transcription keep
+        # running (and queueing) the whole time the dialog sits open.
         if self._running:
             self._stop()
+        messagebox.showerror("Error", message)
 
     def _set_status(self, message: str):
         self._status_var.set(message)
@@ -1086,70 +1174,40 @@ class App(tk.Tk):
 
     def _on_level_callback(self, rms: float):
         """Called from AudioCaptureThread S1 — uses after() for thread safety."""
-        self.after(0, self._update_meter, rms)
+        self._post(self._update_meter, rms)
 
     def _on_s2_level_callback(self, rms: float):
         """Called from AudioCaptureThread S2 — uses after() for thread safety."""
-        self.after(0, self._update_meter_s2, rms)
+        self._post(self._update_meter_s2, rms)
 
     def _on_s2_threshold_change(self, val):
         self._s2_threshold_display_var.set(f"{float(val):.3f}")
         if self._capture_thread_s2 and self._running:
             self._capture_thread_s2.speech_threshold = float(val)
-        self._save_config()
+        self._save_config_debounced()
 
     def _on_s2_silence_change(self, val):
         ms = int(float(val))
         self._s2_silence_display_var.set(f"{ms} ms")
         if self._capture_thread_s2 and self._running:
             self._capture_thread_s2.end_silence_ms = ms
-        self._save_config()
+        self._save_config_debounced()
+
+    def _update_meter(self, rms: float):
+        self._meter_rms_var.set(f"RMS: {rms:.4f}")
+        self._render_meter("_meter_canvas", rms, self._threshold_var.get(), "_meter_peak")
 
     def _update_meter_s2(self, rms: float):
         if not hasattr(self, "_meter_rms_s2_var"):
             return
         self._meter_rms_s2_var.set(f"RMS: {rms:.4f}")
-        if not self._meter_visible:
-            return
-        c = getattr(self, "_meter_canvas_s2", None)
-        if c is None:
-            return
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 2 or h < 2:
-            return
-        MAX_RMS = 0.08
-        frac = min(rms / MAX_RMS, 1.0)
-        thresh = self._s2_threshold_var.get()
-        thresh_frac = min(thresh / MAX_RMS, 1.0)
-        bar_top = int((1.0 - frac) * h)
-        thresh_y = int((1.0 - thresh_frac) * h)
-        if rms > self._s2_meter_peak:
-            self._s2_meter_peak = rms
-        else:
-            self._s2_meter_peak = max(0.0, self._s2_meter_peak - 0.0015)
-        peak_y = max(0, int((1.0 - min(self._s2_meter_peak / MAX_RMS, 1.0)) * h))
-        if rms < thresh:
-            color = "#45475a"
-        elif rms < thresh * 2.5:
-            color = "#a6e3a1"
-        elif rms < thresh * 6:
-            color = "#f9e2af"
-        else:
-            color = "#f38ba8"
-        c.delete("all")
-        c.create_rectangle(0, 0, w, h, fill="#0d0d1a", outline="")
-        if bar_top < h:
-            c.create_rectangle(6, bar_top, w - 6, h, fill=color, outline="")
-        if 0 <= peak_y < h:
-            c.create_line(6, peak_y, w - 6, peak_y, fill=color, width=2)
-        c.create_line(0, thresh_y, w, thresh_y, fill="#89b4fa", width=2, dash=(5, 3))
+        self._render_meter("_meter_canvas_s2", rms, self._s2_threshold_var.get(), "_s2_meter_peak")
 
-    def _update_meter(self, rms: float):
-        self._meter_rms_var.set(f"RMS: {rms:.4f}")
+    def _render_meter(self, canvas_attr: str, rms: float, thresh: float, peak_attr: str):
+        """Draw one level meter column (shared by S1 and S2)."""
         if not self._meter_visible:
             return
-        c = getattr(self, "_meter_canvas", None)
+        c = getattr(self, canvas_attr, None)
         if c is None:
             return
         w = c.winfo_width()
@@ -1159,17 +1217,15 @@ class App(tk.Tk):
 
         MAX_RMS = 0.08
         frac = min(rms / MAX_RMS, 1.0)
-        thresh = self._threshold_var.get()
         thresh_frac = min(thresh / MAX_RMS, 1.0)
         bar_top = int((1.0 - frac) * h)
         thresh_y = int((1.0 - thresh_frac) * h)
 
         # Peak hold with slow decay
-        if rms > self._meter_peak:
-            self._meter_peak = rms
-        else:
-            self._meter_peak = max(0.0, self._meter_peak - 0.0015)
-        peak_y = max(0, int((1.0 - min(self._meter_peak / MAX_RMS, 1.0)) * h))
+        peak = getattr(self, peak_attr)
+        peak = rms if rms > peak else max(0.0, peak - 0.0015)
+        setattr(self, peak_attr, peak)
+        peak_y = max(0, int((1.0 - min(peak / MAX_RMS, 1.0)) * h))
 
         # Color: gray = silent, green = speech detected, yellow = loud, red = clipping
         if rms < thresh:
@@ -1195,14 +1251,14 @@ class App(tk.Tk):
         self._threshold_display_var.set(f"{thresh:.3f}")
         if self._capture_thread and self._running:
             self._capture_thread.speech_threshold = thresh
-        self._save_config()
+        self._save_config_debounced()
 
     def _on_silence_change(self, val):
         ms = int(float(val))
         self._silence_display_var.set(f"{ms} ms")
         if self._capture_thread and self._running:
             self._capture_thread.end_silence_ms = ms
-        self._save_config()
+        self._save_config_debounced()
 
     # ── config persistence ────────────────────────────────────────────────────
 
@@ -1220,9 +1276,28 @@ class App(tk.Tk):
         y = self._options_btn.winfo_rooty() + self._options_btn.winfo_height()
         self.after(1, lambda: self._options_menu.post(x, y))
 
+    def _save_config_debounced(self, delay_ms: int = 400):
+        """Coalesce rapid saves (Scale drags fire per tick) into one write."""
+        if self._save_after_id is not None:
+            self.after_cancel(self._save_after_id)
+        self._save_after_id = self.after(delay_ms, self._save_config_flush)
+
+    def _save_config_flush(self):
+        self._save_after_id = None
+        self._save_config()
+
+    # config.json keys from old versions, superseded by the per-source/per-file
+    # keys below — dropped on save so they don't accumulate forever.
+    _LEGACY_CONFIG_KEYS = (
+        "device", "ts_in_output", "show_lang_tag", "view_ts", "view_lang",
+        "view_translate", "translate_to_ru", "info_tags_in_file",
+    )
+
     def _save_config(self):
         try:
             data = self._load_config()
+            for legacy in self._LEGACY_CONFIG_KEYS:
+                data.pop(legacy, None)
             data["threshold"] = round(self._threshold_var.get(), 4)
             data["end_silence_ms"] = self._silence_var.get()
             data["model"] = self._model_var.get()
@@ -1255,6 +1330,10 @@ class App(tk.Tk):
     # ── shutdown ──────────────────────────────────────────────────────────────
 
     def _on_close(self):
+        self._closing = True  # workers stop posting to the Tk event loop
+        if self._save_after_id is not None:
+            self.after_cancel(self._save_after_id)
+            self._save_after_id = None
         self._save_config()
         self._stats_stop.set()  # signal stats thread to exit cleanly
         self._stop()

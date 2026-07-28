@@ -17,12 +17,6 @@ import numpy as np
 
 from logger import get_logger
 
-try:
-    import psutil as _psutil  # type: ignore[import]
-except ImportError:
-    _psutil = None  # type: ignore
-
-
 
 # Keep strong references to every AddedDllDirectory object returned by
 # os.add_dll_directory().  Python will call __exit__ (which de-registers the
@@ -94,15 +88,20 @@ _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 # ── Hallucination filters ─────────────────────────────────────────────────────
 
-# Common single-word / short-phrase Whisper hallucinations on near-silence.
-# All comparisons are done lower-case with punctuation stripped.
-_PHANTOM_PHRASES: frozenset[str] = frozenset({
-    "bye", "bye-bye", "bye bye", "goodbye", "good bye",
-    "thanks", "thank you", "thank you.", "thanks.",
+# Whisper hallucinations on near-silence, in two tiers.  All comparisons are
+# done lower-case with punctuation stripped.
+# Tier 1: never legitimate as a whole utterance — always suppressed.
+_ALWAYS_PHANTOM: frozenset[str] = frozenset({
+    "you", "i", ".", "!", "...", "hmm", "hm", "um", "uh", "oh", "ah",
     "thanks for watching", "thank you for watching",
-    "you", ".", "!", "...", "hmm", "hm", "um", "uh",
-    "i", "oh", "ah", "okay", "ok", "yes", "no",
     "subscribe", "like and subscribe",
+})
+# Tier 2: real conversational words Whisper also hallucinates on silence.
+# Only suppressed when the segment itself looks unconfident — a clearly-spoken
+# "Yes." or "Goodbye." must survive, because losing it changes meaning.
+_SUSPECT_PHRASES: frozenset[str] = frozenset({
+    "bye", "bye-bye", "bye bye", "goodbye", "good bye",
+    "thanks", "thank you", "okay", "ok", "yes", "no",
 })
 
 
@@ -114,9 +113,12 @@ def _strip_punct(text: str) -> str:
 def _is_phantom(text: str, no_speech_prob: float, avg_logprob: float) -> bool:
     """Return True if the segment looks like a hallucination on near-silence."""
     stripped = _strip_punct(text)
-    # Known phantom phrase list — language-model favourite fillers on silence
-    if stripped in _PHANTOM_PHRASES:
+    if stripped in _ALWAYS_PHANTOM:
         log.debug("Suppressed phantom phrase: %r", text)
+        return True
+    if stripped in _SUSPECT_PHRASES and (no_speech_prob > 0.4 or avg_logprob < -0.6):
+        log.debug("Suppressed suspect phrase (no_speech=%.2f, logprob=%.2f): %r",
+                  no_speech_prob, avg_logprob, text)
         return True
     # Very short output with weak confidence is almost certainly noise
     word_count = len(stripped.split())
@@ -175,15 +177,64 @@ MODEL_OPTIONS = {
 }
 DEFAULT_MODEL_LABEL = "medium (balanced, ~1.5 GB)"
 
+# Whisper expects 16 kHz mono float32
+SAMPLE_RATE = 16_000
+# Whisper's context window is 30 s.  When queued utterances are batched into
+# one inference, stop merging once the concatenated audio (including the 0.5 s
+# silence gaps between utterances) would exceed this cap — anything over it
+# starts a new inference rather than being silently truncated by Whisper.
+_MAX_MERGE_SAMPLES = int(SAMPLE_RATE * 25)  # 25 s — safe headroom
+_SILENCE_GAP = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
+
+
+def _join_with_gaps(chunks: list) -> np.ndarray:
+    """Concatenate audio chunks with 0.5 s of silence between them."""
+    if len(chunks) == 1:
+        return chunks[0]
+    interleaved = []
+    for i, part in enumerate(chunks):
+        interleaved.append(part)
+        if i < len(chunks) - 1:
+            interleaved.append(_SILENCE_GAP)
+    return np.concatenate(interleaved)
+
+
+def _merge_batches(parts: list):
+    """Yield (merged_audio, first_capture_time, chunk_count) batches from a
+    list of (audio_data, capture_time) pairs.
+
+    Chunks merge up to _MAX_MERGE_SAMPLES per batch; a chunk that would
+    overflow the cap starts a new batch, so nothing is ever dropped and no
+    single Whisper call exceeds its context window.
+    """
+    batch: list = []
+    batch_ts: float | None = None
+    running = 0
+    gap = len(_SILENCE_GAP)
+    for aud, c_ts in parts:
+        needed = len(aud) + (gap if batch else 0)
+        if batch and running + needed > _MAX_MERGE_SAMPLES:
+            yield _join_with_gaps(batch), batch_ts, len(batch)
+            batch, batch_ts, running = [], None, 0
+            needed = len(aud)
+        if batch_ts is None:
+            batch_ts = c_ts
+        batch.append(aud)
+        running += needed
+    if batch:
+        yield _join_with_gaps(batch), batch_ts, len(batch)
+
 
 class TranscriberThread(threading.Thread):
     """
     Background thread that:
       1. Loads a faster-whisper WhisperModel (CUDA if available, else CPU).
-      2. Reads (tag, payload, source_id) 3-tuples from *audio_queue*:
-           - ("audio", np.ndarray, int)  → transcribe/translate and call *on_result*
-           - ("error", str, int)         → forward error to *on_error*
-           - ("stop", None, 0)           → exit cleanly
+      2. Reads (tag, payload, source_id[, capture_time]) tuples from *audio_queue*:
+           - ("audio", np.ndarray, int, float)  → transcribe/translate and call *on_result*
+           - ("error", str, int)                → forward error to *on_error*
+           - ("stop", None, 0)                  → exit cleanly
+         The optional 4th element is time.time() at utterance capture, used so
+         result timestamps reflect when words were spoken even under backlog.
       3. Calls *on_result(timestamp, text, language, source_id)* for each segment.
       4. Calls *on_error(message: str)* on errors.
       5. Calls *on_status(message: str)* for status messages (model loading, etc.).
@@ -210,6 +261,13 @@ class TranscriberThread(threading.Thread):
         self.model_size = MODEL_OPTIONS.get(model_label, "medium")
         self.force_device = force_device
         self._stop_event = threading.Event()
+        self._model = None       # set in run(); swapped by CUDA→CPU fallback
+        self._device = "cpu"
+        self._ram_retries = 0    # consecutive mkl_malloc failures
+
+    # Consecutive RAM-pressure retries before an utterance is dropped instead
+    # of being re-queued forever.
+    _MAX_RAM_RETRIES = 5
 
     def stop(self):
         self._stop_event.set()
@@ -243,22 +301,6 @@ class TranscriberThread(threading.Thread):
         # If CUDA DLLs are missing at load time, fall back to CPU automatically.
         for attempt_device, attempt_ct in [(device, compute_type), ("cpu", "int8")]:
             try:
-                # Large models on CPU require 4–6 GB RAM. Warn if it looks tight.
-                if attempt_device == "cpu" and self.model_size in ("large", "large-v2"):
-                    if _psutil is not None:
-                        try:
-                            free_gb = _psutil.virtual_memory().available / 1024 ** 3
-                            if free_gb < 4.0:
-                                self.on_status(
-                                    f"WARNING: '{self.model_size}' on CPU needs ~4–6 GB free RAM "
-                                    f"(only {free_gb:.1f} GB available). Loading may fail or be very slow."
-                                )
-                                log.warning(
-                                    "Low RAM for large model on CPU: %.1f GB free", free_gb
-                                )
-                        except Exception:
-                            pass
-
                 model = WhisperModel(
                     _resolve_model_path(self.model_size),
                     device=attempt_device,
@@ -314,15 +356,13 @@ class TranscriberThread(threading.Thread):
 
         self.on_status("Ready — listening…")
 
+        # The recovery helpers mutate these on CUDA→CPU fallback, so they live
+        # on self rather than as locals of run().
+        self._model = model
+        self._device = device
+        self._ram_retries = 0
+
         utterance_seq = 0
-        SAMPLE_RATE = 16_000
-        SILENCE_GAP = np.zeros(int(SAMPLE_RATE * 0.5), dtype=np.float32)
-        # Whisper's context window is 30 seconds of audio.  When multiple
-        # queued utterances are batched together, stop merging once the
-        # concatenated audio (including 0.5 s silence gaps) would exceed this.
-        # Anything over the cap starts a new inference call rather than being
-        # silently truncated by Whisper.
-        WHISPER_MAX_MERGE_SAMPLES = int(SAMPLE_RATE * 25)  # 25 s — safe headroom
 
         while not self._stop_event.is_set():
             try:
@@ -333,6 +373,7 @@ class TranscriberThread(threading.Thread):
             tag = item[0]
             payload = item[1]
             source_id = item[2] if len(item) > 2 else 1
+            cap_ts = item[3] if len(item) > 3 else time.time()
 
             if tag == "stop":
                 break
@@ -344,228 +385,60 @@ class TranscriberThread(threading.Thread):
                 continue
             if tag != "audio":
                 continue
-            queued_audio: list = []  # list of (audio_data, source_id)
+
+            # Drain whatever else queued up while the last inference ran.
+            queued_audio: list = []  # (audio_data, source_id, capture_time)
             while True:
                 try:
                     next_item = self.audio_queue.get_nowait()
                 except queue.Empty:
                     break
                 next_tag = next_item[0]
-                next_payload = next_item[1]
-                next_src = next_item[2] if len(next_item) > 2 else 1
                 if next_tag == "stop":
                     self._stop_event.set()
                     break
                 if next_tag == "error":
-                    self.on_error(next_payload)
+                    self.on_error(next_item[1])
                     break
                 if next_tag == "audio":
-                    queued_audio.append((next_payload, next_src))
+                    queued_audio.append((
+                        next_item[1],
+                        next_item[2] if len(next_item) > 2 else 1,
+                        next_item[3] if len(next_item) > 3 else time.time(),
+                    ))
                 # status tags discarded (stale by now)
 
-            # audio_parts is list of (audio_data, source_id)
-            # Only batch items from the same source to avoid cross-source merging.
-            audio_parts = [(payload, source_id)] + queued_audio
+            if self._stop_event.is_set():
+                # Audio captured after Stop is discarded anyway — don't burn
+                # seconds of inference on a backlog nobody will see.
+                break
+
+            audio_parts = [(payload, source_id, cap_ts)] + queued_audio
             seq_start = utterance_seq + 1
             utterance_seq += len(audio_parts)
             seq_end = utterance_seq
             seq_label = f"#{seq_start}" if seq_start == seq_end else f"#{seq_start}–{seq_end}"
 
+            # Group by source (insertion-ordered) so an interleaved two-source
+            # backlog (S1,S2,S1,…) still merges each source's chunks instead of
+            # degrading to one inference per utterance.  Per-source order is
+            # preserved and sources never mix within one inference.
+            groups: dict[int, list] = {}
+            for aud, src, c_ts in audio_parts:
+                groups.setdefault(src, []).append((aud, c_ts))
 
-            # Group consecutive same-source items; process each group separately.
-            groups: list[tuple[int, list]] = []  # (source_id, [audio_arrays])
-            for aud, src in audio_parts:
-                if groups and groups[-1][0] == src:
-                    groups[-1][1].append(aud)
-                else:
-                    groups.append((src, [aud]))
-
-            for grp_src, grp_parts in groups:
-                if len(grp_parts) == 1:
-                    audio_data = grp_parts[0]
-                else:
-                    # Merge consecutive chunks up to WHISPER_MAX_MERGE_SAMPLES.
-                    # When a chunk would push the batch over the limit, flush the
-                    # current batch as its own inference and start a new one.
-                    # This keeps all audio — nothing is dropped — while ensuring
-                    # no single Whisper call ever exceeds its 30 s context window.
-                    batches: list[list] = [[]]
-                    running_samples = 0
-                    gap_samples = len(SILENCE_GAP)
-                    for part in grp_parts:
-                        chunk_samples = len(part)
-                        needed = chunk_samples + (gap_samples if batches[-1] else 0)
-                        if batches[-1] and running_samples + needed > WHISPER_MAX_MERGE_SAMPLES:
-                            # Start a fresh batch for this chunk
-                            batches.append([])
-                            running_samples = 0
-                        batches[-1].append(part)
-                        running_samples += chunk_samples + (gap_samples if len(batches[-1]) > 1 else 0)
-
-                    for batch in batches:
-                        if len(batch) == 1:
-                            merged = batch[0]
-                        else:
-                            interleaved = []
-                            for i, part in enumerate(batch):
-                                interleaved.append(part)
-                                if i < len(batch) - 1:
-                                    interleaved.append(SILENCE_GAP)
-                            merged = np.concatenate(interleaved)
-                        # Use the merged array as the audio_data for this batch
-                        # by appending it back; the single-chunk path below will
-                        # pick it up.  For simplicity we just reassign and fall
-                        # through — but we need to handle multi-batch groups inline.
-                        batch_duration = len(merged) / SAMPLE_RATE
-                        log.debug("Transcribing %s src=%d (%.2f s, batch of %d)",
-                                  seq_label, grp_src, batch_duration, len(batch))
-                        self.on_status(f"Translating {seq_label} ({batch_duration:.1f}s)…")
-                        try:
-                            segments, info = model.transcribe(
-                                merged,
-                                task="translate",
-                                beam_size=1,
-                                temperature=0.0,
-                                log_prob_threshold=None,
-                                no_speech_threshold=0.6,
-                                condition_on_previous_text=False,
-                                without_timestamps=True,
-                                vad_filter=True,
-                                vad_parameters={"min_silence_duration_ms": 300},
-                                repetition_penalty=1.3,
-                            )
-                            log.debug("%s — language=%s (prob=%.2f)",
-                                      seq_label, info.language, info.language_probability)
-                            for segment in segments:
-                                text = segment.text.strip()
-                                if not text:
-                                    continue
-                                if _is_repetition_loop(text):
-                                    continue
-                                if _is_phantom(text,
-                                               getattr(segment, "no_speech_prob", 0.0),
-                                               getattr(segment, "avg_logprob", 0.0)):
-                                    continue
-                                ts = time.strftime("%H:%M:%S")
-                                log.info("[%s] %s %s", ts, seq_label, text)
-                                self.on_result(ts, text, info.language, grp_src)
-                            self.on_status("Listening…")
-                            time.sleep(0.15)
-                        except Exception as exc:  # noqa: BLE001
-                            log.warning("Batch transcription error: %s", exc)
-                            self.on_status("Listening…")
-                    continue  # skip the single-chunk path below for multi-part groups
-
-                audio_data = grp_parts[0]  # single-chunk groups fall through to here
-                duration = len(audio_data) / SAMPLE_RATE
-                try:
-                    log.debug("Transcribing %s src=%d (%.2f s)", seq_label, grp_src, duration)
-                    self.on_status(f"Translating {seq_label} ({duration:.1f}s)…")
-
-                    segments, info = model.transcribe(
-                        audio_data,
-                        task="translate",       # outputs English directly
-                        beam_size=1,            # greedy decode — no beam search overhead
-                        temperature=0.0,        # single pass only; disables the fallback
-                                                # retry loop (0.0→0.2→0.4→0.6→0.8→1.0)
-                                                # that was doing 6× the GPU work per utterance
-                        log_prob_threshold=None,        # don't trigger temperature fallback
-                        no_speech_threshold=0.6,        # skip silent/noise segments fast
-                        condition_on_previous_text=False,  # no prompt carry-over overhead
-                        without_timestamps=True,           # skip timestamp decode pass
-                        vad_filter=True,
-                        vad_parameters={"min_silence_duration_ms": 300},
-                        repetition_penalty=1.3,    # penalise repeated tokens — suppresses
-                                                   # "Come on, come on, come on..." loops
-                    )
-                    log.debug(
-                        "%s — language=%s (prob=%.2f)",
-                        seq_label, info.language, info.language_probability
-                    )
-                    for segment in segments:
-                        text = segment.text.strip()
-                        if not text:
-                            continue
-                        # ── Hallucination filters ────────────────────────────────
-                        if _is_repetition_loop(text):
-                            continue
-                        if _is_phantom(
-                            text,
-                            getattr(segment, "no_speech_prob", 0.0),
-                            getattr(segment, "avg_logprob", 0.0),
-                        ):
-                            continue
-                        # ───────────────────────────────────────────────
-                        ts = time.strftime("%H:%M:%S")
-                        log.info("[%s] %s %s", ts, seq_label, text)
-                        self.on_result(ts, text, info.language, grp_src)
-                    # Never break out of the segment generator mid-inference.
-                    # Interrupting the lazy ctranslate2 generator leaves its
-                    # internal C++ decoder state allocated; when the model is
-                    # later GC'd the destructor crashes with std::terminate()
-                    # (exception code 0xc0000409 in ucrtbase.dll).  Instead we
-                    # let the current utterance finish, then the outer while
-                    # loop's stop-event check exits cleanly.
-                    self.on_status("Listening…")
-                    # Yield GPU time back to foreground apps between inferences.
-                    # 150 ms is imperceptible as translation latency but gives the
-                    # OS GPU scheduler a window to service the game.
-                    time.sleep(0.15)
-                except Exception as exc:  # noqa: BLE001
-                    err_str = str(exc).lower()
-                    # mkl_malloc failure = Intel MKL can't get RAM — happens when the
-                    # game's loading screen temporarily consumes most system RAM.
-                    # Transient: wait for loading to finish, skip utterance, continue.
-                    ram_pressure = "mkl_malloc" in err_str or "mkl-service" in err_str
-                    cuda_failure = device == "cuda" and not ram_pressure and (
-                        "dll" in err_str
-                        or "library" in err_str
-                        or "out of memory" in err_str
-                        or "bad allocation" in err_str
-                        or isinstance(exc, MemoryError)
-                    )
-                    if ram_pressure:
-                        log.warning("RAM pressure on %s (%s) — waiting 2 s then retrying", seq_label, exc)
-                        self.on_status("Low RAM (game loading?) — pausing, will retry…")
-                        time.sleep(2.0)  # wait for loading screen to release RAM
-                        # Re-queue the utterance so it gets translated once RAM frees up.
-                        # The audio data itself is safe — it lives in Python's heap, not
-                        # MKL's allocation arena.  Only MKL's internal scratchpad failed.
-                        self.audio_queue.put(("audio", audio_data, grp_src))
-                        self.on_status("Listening…")
-                    elif cuda_failure:
-                        # GPU ran out of VRAM (game took it all) or CUDA DLL missing.
-                        # Fall back to CPU silently and keep the session running —
-                        # do NOT call on_error() which would stop the app.
-                        log.warning("CUDA failure on %s (%s) — falling back to CPU", seq_label, exc)
-                        self.on_status("VRAM full — switching to CPU and retrying…")
-                        try:
-                            # Free VRAM explicitly before parking. unload_model() releases
-                            # the ctranslate2 GPU allocations without running the crashing
-                            # C++ destructor path.  The empty object is then parked so
-                            # the (now no-op) destructor never runs from the GC either.
-                            try:
-                                model.model.unload_model(to_cpu=False)
-                                log.debug("CUDA model unloaded from VRAM before CPU fallback")
-                            except Exception:
-                                pass
-                            _RETIRED_MODELS.append(model)  # suppress crashing destructor
-                            model = WhisperModel(
-                                _resolve_model_path(self.model_size), device="cpu", compute_type="int8",
-                                cpu_threads=2, num_workers=1,
-                            )
-                            device = "cpu"
-                            log.warning("Permanently switched to CPU (int8) after CUDA failure")
-                            self.on_device_info("cpu", "int8")
-                            self.on_status("Switched to CPU (VRAM full). Translation continuing…")
-                            # Re-queue this batch so it gets translated on CPU
-                            self.audio_queue.put(("audio", audio_data, grp_src))
-                        except Exception as cpu_exc:  # noqa: BLE001
-                            log.exception("CPU fallback also failed")
-                            self.on_error(f"Fatal transcription error: {cpu_exc}")
-                    else:
-                        log.exception("Transcription error on %s", seq_label)
-                        self.on_error(f"Transcription error: {exc}")
+            # Transcribe batches in capture-time order across sources so the
+            # combined transcript stays chronological even though merging is
+            # done per source.
+            batches: list[tuple] = []
+            for grp_src, grp_parts in groups.items():
+                for merged, batch_ts, batch_count in _merge_batches(grp_parts):
+                    batches.append((batch_ts, merged, grp_src, batch_count))
+            batches.sort(key=lambda b: b[0])
+            for batch_ts, merged, grp_src, batch_count in batches:
+                if self._stop_event.is_set():
+                    break
+                self._transcribe_audio(merged, grp_src, seq_label, batch_ts, batch_count)
 
         # Free VRAM and park the model shell.  unload_model() releases the GPU
         # allocations explicitly, so VRAM is returned immediately on Stop.
@@ -573,21 +446,148 @@ class TranscriberThread(threading.Thread):
         # ctranslate2's crashing C++ destructor from ever running.  CPU models
         # are let go normally — their destructors are safe and free ~1.5 GB RAM.
         try:
-            if device == "cuda":
+            if self._device == "cuda":
                 try:
-                    model.model.unload_model(to_cpu=False)
+                    self._model.model.unload_model(to_cpu=False)
                     log.debug("CUDA model VRAM freed via unload_model()")
                 except Exception:
                     pass
-                _RETIRED_MODELS.append(model)
+                _RETIRED_MODELS.append(self._model)
                 log.debug("CUDA model shell parked in _RETIRED_MODELS (destructor suppressed)")
             else:
                 log.debug("CPU model released to GC")
         except Exception:
             pass
+        self._model = None
 
         log.info("TranscriberThread stopped")
         self.on_status("Stopped.")
+
+    def _transcribe_audio(self, audio_data: np.ndarray, grp_src: int,
+                          seq_label: str, capture_ts: float,
+                          batch_count: int = 1) -> None:
+        """Run one Whisper inference and emit filtered results.
+
+        Single utterances and merged batches both come through here, so the
+        error recovery (RAM-pressure retry, CUDA→CPU fallback) can never
+        diverge between the two paths again.
+        """
+        duration = len(audio_data) / SAMPLE_RATE
+        note = f", batch of {batch_count}" if batch_count > 1 else ""
+        log.debug("Transcribing %s src=%d (%.2f s%s)", seq_label, grp_src, duration, note)
+        self.on_status(f"Translating {seq_label} ({duration:.1f}s)…")
+        try:
+            segments, info = self._model.transcribe(
+                audio_data,
+                task="translate",       # outputs English directly
+                beam_size=1,            # greedy decode — no beam search overhead
+                temperature=0.0,        # single pass only; disables the fallback
+                                        # retry loop (0.0→0.2→0.4→0.6→0.8→1.0)
+                                        # that was doing 6× the GPU work per utterance
+                log_prob_threshold=None,        # don't trigger temperature fallback
+                no_speech_threshold=0.6,        # skip silent/noise segments fast
+                condition_on_previous_text=False,  # no prompt carry-over overhead
+                without_timestamps=True,           # skip timestamp decode pass
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300},
+                repetition_penalty=1.3,    # penalise repeated tokens — suppresses
+                                           # "Come on, come on, come on..." loops
+            )
+            log.debug("%s — language=%s (prob=%.2f)",
+                      seq_label, info.language, info.language_probability)
+            # Timestamp reflects when the audio was captured, not when the
+            # (possibly backlogged) inference finally ran.
+            ts = time.strftime("%H:%M:%S", time.localtime(capture_ts))
+            for segment in segments:
+                text = segment.text.strip()
+                if not text:
+                    continue
+                if _is_repetition_loop(text):
+                    continue
+                if _is_phantom(text,
+                               getattr(segment, "no_speech_prob", 0.0),
+                               getattr(segment, "avg_logprob", 0.0)):
+                    continue
+                log.info("[%s] %s %s", ts, seq_label, text)
+                self.on_result(ts, text, info.language, grp_src)
+            # Never break out of the segment generator mid-inference.
+            # Interrupting the lazy ctranslate2 generator leaves its internal
+            # C++ decoder state allocated; when the model is later GC'd the
+            # destructor crashes with std::terminate() (exception code
+            # 0xc0000409 in ucrtbase.dll).
+            self._ram_retries = 0
+            self.on_status("Listening…")
+            # Yield GPU time back to foreground apps between inferences.
+            # 150 ms is imperceptible as translation latency but gives the
+            # OS GPU scheduler a window to service the game.
+            time.sleep(0.15)
+        except Exception as exc:  # noqa: BLE001
+            self._recover_from_inference_error(exc, audio_data, grp_src, capture_ts, seq_label)
+
+    def _recover_from_inference_error(self, exc: Exception, audio_data: np.ndarray,
+                                      grp_src: int, capture_ts: float,
+                                      seq_label: str) -> None:
+        err_str = str(exc).lower()
+        # mkl_malloc failure = Intel MKL can't get RAM — happens when the
+        # game's loading screen temporarily consumes most system RAM.
+        ram_pressure = "mkl_malloc" in err_str or "mkl-service" in err_str
+        cuda_failure = self._device == "cuda" and not ram_pressure and (
+            "dll" in err_str
+            or "library" in err_str
+            or "out of memory" in err_str
+            or "bad allocation" in err_str
+            or isinstance(exc, MemoryError)
+        )
+        if ram_pressure:
+            self._ram_retries += 1
+            if self._ram_retries > self._MAX_RAM_RETRIES:
+                log.error("RAM pressure persisted through %d retries — dropping %s",
+                          self._MAX_RAM_RETRIES, seq_label)
+                self.on_status("Low RAM — utterance dropped after repeated retries.")
+                self._ram_retries = 0
+                return
+            log.warning("RAM pressure on %s (%s) — waiting 2 s then retrying", seq_label, exc)
+            self.on_status("Low RAM (game loading?) — pausing, will retry…")
+            time.sleep(2.0)  # wait for loading screen to release RAM
+            # Re-queue the audio so it gets translated once RAM frees up.
+            # The audio data itself is safe — it lives in Python's heap, not
+            # MKL's allocation arena.  Only MKL's internal scratchpad failed.
+            self.audio_queue.put(("audio", audio_data, grp_src, capture_ts))
+            self.on_status("Listening…")
+        elif cuda_failure:
+            # GPU ran out of VRAM (game took it all) or CUDA DLL missing.
+            # Fall back to CPU silently and keep the session running —
+            # do NOT call on_error() which would stop the app.
+            log.warning("CUDA failure on %s (%s) — falling back to CPU", seq_label, exc)
+            self.on_status("VRAM full — switching to CPU and retrying…")
+            try:
+                # Free VRAM explicitly before parking. unload_model() releases
+                # the ctranslate2 GPU allocations without running the crashing
+                # C++ destructor path.  The empty object is then parked so
+                # the (now no-op) destructor never runs from the GC either.
+                try:
+                    self._model.model.unload_model(to_cpu=False)
+                    log.debug("CUDA model unloaded from VRAM before CPU fallback")
+                except Exception:
+                    pass
+                _RETIRED_MODELS.append(self._model)  # suppress crashing destructor
+                from faster_whisper import WhisperModel  # cached — already imported in run()
+                self._model = WhisperModel(
+                    _resolve_model_path(self.model_size), device="cpu", compute_type="int8",
+                    cpu_threads=2, num_workers=1,
+                )
+                self._device = "cpu"
+                log.warning("Permanently switched to CPU (int8) after CUDA failure")
+                self.on_device_info("cpu", "int8")
+                self.on_status("Switched to CPU (VRAM full). Translation continuing…")
+                # Re-queue this audio so it gets translated on CPU
+                self.audio_queue.put(("audio", audio_data, grp_src, capture_ts))
+            except Exception as cpu_exc:  # noqa: BLE001
+                log.exception("CPU fallback also failed")
+                self.on_error(f"Fatal transcription error: {cpu_exc}")
+        else:
+            log.exception("Transcription error on %s", seq_label)
+            self.on_error(f"Transcription error: {exc}")
 
     @staticmethod
     def _select_device(force: str = "Auto") -> tuple[str, str]:

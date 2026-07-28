@@ -83,8 +83,16 @@ def setup_logging(level: int = logging.DEBUG) -> None:
 
 def _prune_session_files() -> None:
     """Delete oldest session log files beyond _MAX_SESSION_FILES."""
-    pattern = os.path.join(_SESSION_DIR, "app_*.log")
-    files = sorted(glob.glob(pattern))  # lexicographic = chronological for ISO stamps
+    files = glob.glob(os.path.join(_SESSION_DIR, "session_*.log"))
+    files += glob.glob(os.path.join(_SESSION_DIR, "app_*.log"))  # legacy naming
+
+    def _safe_mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0  # vanished since glob — sorts first, remove attempt is a no-op
+
+    files.sort(key=_safe_mtime)  # oldest first
     excess = len(files) - _MAX_SESSION_FILES
     if excess > 0:
         for old in files[:excess]:

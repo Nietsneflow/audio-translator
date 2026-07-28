@@ -7,6 +7,7 @@ numpy float32 chunks (16 kHz mono) into a queue for transcription.
 import collections
 import ctypes
 import threading
+import time
 import queue
 import numpy as np
 
@@ -115,6 +116,7 @@ def get_loopback_device(name: str | None = None):
         for m in all_lb:
             if m.name == name:
                 return m
+        log.warning("Device %r not found — falling back to %r", name, all_lb[0].name)
     # Fall back to first loopback device
     return all_lb[0]
 
@@ -128,10 +130,11 @@ class AudioCaptureThread(threading.Thread):
     the accumulated float32 numpy array is put into *audio_queue* so Whisper
     receives a complete sentence rather than an arbitrary chunk.
 
-    Queue message types:
-        ("audio",  np.ndarray)  — a complete utterance ready for translation
-        ("status", str)         — informational status for the GUI status bar
-        ("error",  str)         — fatal error; thread will exit
+    Queue message types (last element is always this thread's source_id;
+    audio tuples also carry the utterance's capture start time):
+        ("audio",  np.ndarray, int, float)  — a complete utterance ready for translation
+        ("status", str, int)                — informational status for the GUI status bar
+        ("error",  str, int)                — fatal error; thread will exit
     """
 
     def __init__(self, audio_queue: queue.Queue, device_name: str | None = None,
@@ -169,6 +172,14 @@ class AudioCaptureThread(threading.Thread):
             log.error("Device selection failed: %s", exc)
             self.audio_queue.put(("error", str(exc), self.source_id))
             return
+        if self.device_name and device.name != self.device_name:
+            # Saved device is gone (unplugged/renamed) — tell the user instead
+            # of silently capturing from whatever enumerated first.
+            self.audio_queue.put((
+                "status",
+                f"⚠ Device '{self.device_name}' not found — capturing from '{device.name}' instead",
+                self.source_id,
+            ))
 
         # Raw read block size; smaller = more responsive stop detection.
         block_size = 512
@@ -193,10 +204,17 @@ class AudioCaptureThread(threading.Thread):
                     "Utterance emitted: %.2f s (%d speech frames)",
                     len(audio) / SAMPLE_RATE, speech_frame_count
                 )
-                self.audio_queue.put(("audio", audio, self.source_id))
+                # Capture start time ≈ now minus the utterance's own duration —
+                # the transcriber stamps results with this, not inference time.
+                started = time.time() - len(audio) / SAMPLE_RATE
+                self.audio_queue.put(("audio", audio, self.source_id, started))
                 self.audio_queue.put(("status", "Processing…", self.source_id))
             else:
                 log.debug("Discarded short noise burst (%d speech frames)", speech_frame_count)
+            # Clear the pre-roll ring so the next utterance can't be prefixed
+            # with stale audio captured before this one ended (the ring is only
+            # refreshed while in _SILENT state).
+            pre_roll.clear()
             utterance_frames = []
             speech_frame_count = 0
             silence_frame_count = 0

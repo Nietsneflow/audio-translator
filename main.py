@@ -16,29 +16,45 @@ Prerequisites (one-time):
 import sys
 import threading
 import traceback
+from importlib.util import find_spec
 
 from logger import setup_logging
 
 
+def _fatal(message: str):
+    """Exit with a visible error.  The app is normally launched with pythonw
+    (no console), where sys.exit's stderr message is invisible — show a
+    Windows message box so a missing-dependency failure is never silent."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, message, "Audio Translate", 0x10)  # MB_ICONERROR
+    except Exception:
+        pass
+    sys.exit(message)
+
+
 def _check_python_version():
     if sys.version_info < (3, 10):
-        sys.exit(
+        _fatal(
             f"Python 3.10 or newer is required (you have {sys.version}).\n"
             "Download from https://www.python.org/downloads/"
         )
 
 
 def _check_dependencies():
-    missing = []
-    for pkg in ("soundcard", "faster_whisper", "numpy"):
-        try:
-            __import__(pkg)
-        except ImportError:
-            missing.append(pkg)
+    # find_spec checks presence without importing — importing faster_whisper
+    # here would pull in ctranslate2 and add seconds before any window shows.
+    missing = [pkg for pkg in ("soundcard", "faster_whisper", "numpy")
+               if find_spec(pkg) is None]
     if missing:
-        sys.exit(
+        _fatal(
             "Missing dependencies: " + ", ".join(missing) + "\n"
             "Install them with:  pip install -r requirements.txt"
+        )
+    if find_spec("tkinter") is None or find_spec("_tkinter") is None:
+        _fatal(
+            "This Python installation is missing tkinter (tcl/tk).\n"
+            "Reinstall Python with the 'tcl/tk and IDLE' option enabled."
         )
 
 
@@ -79,10 +95,14 @@ if __name__ == "__main__":
     # BELOW_NORMAL_PRIORITY_CLASS = 0x4000
     try:
         import ctypes
-        ctypes.windll.kernel32.SetPriorityClass(
-            ctypes.windll.kernel32.GetCurrentProcess(), 0x4000
-        )
-        log.info("Process priority set to BELOW_NORMAL")
+        # use_last_error so ctypes captures the error code at call time —
+        # windll.kernel32.GetLastError() afterwards can report a stale value.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ok = kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x4000)
+        if ok:
+            log.info("Process priority set to BELOW_NORMAL")
+        else:
+            log.warning("SetPriorityClass failed (error %d)", ctypes.get_last_error())
     except Exception:
         pass
 
