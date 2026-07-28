@@ -7,6 +7,7 @@ exit /b %ERRORLEVEL%
 
 :main
 title Audio Translator — Update
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 echo =============================================
@@ -58,11 +59,16 @@ if errorlevel 1 (
     git init
     git remote add origin https://github.com/Nietsneflow/audio-translator.git
     git fetch origin main
-    git reset --hard origin/main
     if errorlevel 1 (
         echo.
         echo ERROR: Could not connect to the update server.
         echo Please check your internet connection and try again.
+        goto :done
+    )
+    git reset --hard origin/main
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Could not apply the downloaded update.
         goto :done
     )
     echo.
@@ -71,10 +77,55 @@ if errorlevel 1 (
     goto :post_pull
 )
 
+:: Safety: confirm this folder itself is the repo root.  rev-parse succeeds
+:: from any subfolder of any repo, so without this check, extracting the app
+:: inside another Git repository would hard-reset THAT repository.
+set "REPO_ROOT="
+for /f "delims=" %%t in ('git rev-parse --show-toplevel 2^>nul') do set "REPO_ROOT=%%t"
+if not defined REPO_ROOT (
+    echo ERROR: Could not determine the Git repository root.
+    goto :done
+)
+set "REPO_ROOT=%REPO_ROOT:/=\%"
+set "HERE=%~dp0"
+if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
+if /i not "%REPO_ROOT%"=="%HERE%" (
+    echo ERROR: This folder is inside a different Git repository:
+    echo   %REPO_ROOT%
+    echo Update aborted so that repository is not reset.
+    echo Move the app to its own folder and run Update.bat again.
+    goto :done
+)
+
+:: Safety: reset --hard permanently discards local edits — ask first.
+:: Untracked files are excluded: reset --hard never touches them, so they
+:: must not trigger the scary prompt.  (No pipe to find.exe here on purpose:
+:: with Git Bash/MSYS tools on PATH, "find" can resolve to GNU find and hang.)
+set "DIRTY="
+for /f "delims=" %%c in ('git status --porcelain --untracked-files^=no') do set "DIRTY=1"
+if defined DIRTY (
+    echo WARNING: You have local changes to these app files:
+    git status --short --untracked-files=no
+    echo.
+    echo Updating will PERMANENTLY DISCARD the changes above.
+    echo Continue and discard local changes? Type Y then Enter to continue:
+    set /p "CONT="
+    if /i not "!CONT!"=="Y" (
+        echo Update cancelled - no files were changed.
+        goto :done
+    )
+)
+
 :: Pull latest changes
 echo Checking for updates...
 echo.
 git fetch origin main
+if errorlevel 1 (
+    echo.
+    echo ERROR: Could not reach the update server.
+    echo Check your internet connection and try again.
+    goto :done
+)
 git reset --hard origin/main
 if errorlevel 1 (
     echo.
@@ -88,7 +139,9 @@ if errorlevel 1 (
 echo.
 echo Updating dependencies...
 echo.
-pip install -r requirements.txt -q
+:: python -m pip guarantees the same interpreter Launch.bat's pythonw uses;
+:: bare "pip" can resolve to a different Python on multi-install machines.
+python -m pip install -r requirements.txt -q
 if errorlevel 1 (
     echo WARNING: Dependency update had errors. The app may still work.
 ) else (

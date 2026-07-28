@@ -46,13 +46,16 @@ it force-resets all files to the latest version then updates.
 
 MODELS
 ------
-Speech recognition models are bundled in the models\ folder:
+Speech recognition models live in the models\ folder:
 
   models\small\    - ~500 MB  (fast, good for CPU)
   models\medium\   - ~1.5 GB  (more accurate, best with GPU)
 
-The app loads them from this folder — no internet connection
-is needed once setup is complete.
+If a model folder is present the app loads it from disk with no
+internet needed.  If it is missing (models are not included in
+the installer zip), the app downloads the selected model
+automatically the first time you press Start — that first run
+needs an internet connection and may take a few minutes.
 
 Use the Model dropdown in the toolbar to switch between them.
 
@@ -122,7 +125,7 @@ Transcripts (saves to files)
 
 Live View (on-screen panes)
   Same options as Transcripts but only affect what is displayed
-  on screen (and printed to the console/PowerShell window).
+  on screen.
 
 Always on top
   Keep the app window above all other windows.
@@ -184,8 +187,9 @@ USAGE TIPS
   filtered out automatically.
 - If translation feels too slow, switch to the small model or
   set Processor to CPU to free up the GPU for other apps.
-- Translations are also printed to the PowerShell/console
-  window in the format:  [S1] [HH:MM:SS] text
+- If you start the app from a terminal with "python main.py"
+  (instead of Launch.bat), translations are also printed to
+  that terminal in the format:  [S1] [HH:MM:SS] text
 
 
 FILES IN THIS PACKAGE
@@ -201,7 +205,11 @@ FILES IN THIS PACKAGE
   Update.bat                     - Pull latest version and update
   Repair.bat                     - Force-reset broken installation
   Launch.bat                     - Start the app
-  models\small\                  - Bundled small Whisper model
-  models\medium\                 - Bundled medium Whisper model
+
+Not included in the zip (created/downloaded on this PC):
+  models\small\, models\medium\  - Whisper models (auto-downloaded
+                                   on first Start if missing)
+  config.json                    - your saved settings
+  logs\                          - session and error logs
 
 ================================================

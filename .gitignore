@@ -5,6 +5,7 @@ logs/
 output.txt
 Source1.txt
 Source2.txt
+*.txt.tmp
 install_log.txt
 /config.json
 
@@ -25,6 +26,9 @@ models/**/model.bin
 
 # VS Code
 .vscode/
+
+# Copilot agents (local only)
+.github/agents/
 
 # Build output
 Install/

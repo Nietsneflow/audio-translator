@@ -32,9 +32,11 @@ if not exist "%~dp0main.py" (
 echo [%DATE% %TIME%] Launching Audio Translator... >> "%LOGFILE%"
 start "" pythonw main.py
 
-:: Wait 5 seconds then check if the process actually started
+:: Wait 5 seconds then check if the process actually started.
+:: Match on the command line (pythonw running main.py), not just the image
+:: name — any other pythonw app would otherwise mask a startup crash.
 timeout /t 5 /nobreak >nul
-tasklist /fi "imagename eq pythonw.exe" /fo csv 2>nul | find /i "pythonw.exe" >nul
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | Where-Object { $_.CommandLine -match 'main\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if errorlevel 1 (
     echo [%DATE% %TIME%] WARNING: pythonw.exe not found 5s after launch. App may have crashed. >> "%LOGFILE%"
     echo WARNING: The app may have failed to start.

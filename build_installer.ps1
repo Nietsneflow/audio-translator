@@ -12,15 +12,20 @@ if (Test-Path $zipFile) {
     Write-Host "Removed old package."
 }
 
-# Files to include
+# Files to include — keep in sync with the "FILES IN THIS PACKAGE" list
+# in readme.txt (models\ ships separately: too large for the zip, and the
+# app auto-downloads a missing model on first Start).
 $files = @(
     "main.py",
     "gui.py",
     "transcriber.py",
     "audio_capture.py",
     "logger.py",
+    "download_translation_model.py",
     "requirements.txt",
     "setup.bat",
+    "Update.bat",
+    "Repair.bat",
     "Launch.bat",
     "readme.txt"
 ) | ForEach-Object { Join-Path $root $_ }

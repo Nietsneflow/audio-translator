@@ -116,26 +116,16 @@ for /f "tokens=*" %%v in ('git --version 2^>^&1') do echo Found: %%v
 echo.
 
 :: ── Step 2: Upgrade pip ───────────────────────────
-echo [1/3] Upgrading pip...
+echo [1/4] Upgrading pip...
 python -m pip install --upgrade pip -q
 echo       Done.
 echo.
 
-:: ── Step 3: Core dependencies ─────────────────────
-echo [2/3] Installing core dependencies...
-python -m pip install "faster-whisper>=1.0.0" "soundcard>=0.4.3" "numpy>=1.24.0,<2.0" "psutil>=5.9.0" "pynvml>=11.0.0"
-if errorlevel 1 (
-    echo.
-    echo [ERROR] Core dependency install failed.
-    echo Share install_log.txt with the person who gave you this app for help.
-    pause
-    exit /b 1
-)
-echo       Done.
-echo.
-
-:: ── Step 4: PyTorch (large download) ─────────────
-echo [3/3] Installing PyTorch with CUDA support...
+:: ── Step 3: PyTorch (large download) ─────────────
+:: Installed FIRST from the CUDA index so the GPU build lands before
+:: requirements.txt is processed (which would otherwise pull the CPU-only
+:: PyPI wheel to satisfy the torch requirement).
+echo [2/4] Installing PyTorch with CUDA support...
 echo       This downloads ~2.5 GB and may take several minutes.
 echo       If you have no NVIDIA GPU this still works - it will use CPU.
 echo.
@@ -148,6 +138,33 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+echo       Done.
+echo.
+
+:: ── Step 4: Everything else from requirements.txt ─
+:: Single source of truth — a hand-maintained list here WILL drift from
+:: requirements.txt again (it already had: argostranslate was missing).
+echo [3/4] Installing dependencies from requirements.txt...
+python -m pip install -r "%~dp0requirements.txt"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Dependency install failed.
+    echo Share install_log.txt with the person who gave you this app for help.
+    pause
+    exit /b 1
+)
+echo       Done.
+echo.
+
+:: ── Step 5: Offline translation pack ─────────────
+echo [4/4] Downloading the English to Russian translation pack (~80 MB)...
+python "%~dp0download_translation_model.py"
+if errorlevel 1 (
+    echo.
+    echo WARNING: Translation pack download failed. The app still works -
+    echo the optional "Translate English to Russian" feature can be set up
+    echo later by running:  python download_translation_model.py
+)
 echo.
 
 :: ── Done ──────────────────────────────────────────
@@ -155,12 +172,16 @@ echo ================================================
 echo   Installation complete!
 echo ================================================
 echo.
-echo Speech recognition models are included in the models\ folder.
-echo No internet download of models is required.
+echo Speech recognition models load from the models\ folder if present.
+echo If that folder is missing, the selected model is downloaded
+echo automatically the first time you press Start (internet required once).
 echo.
 echo Installation finished: %DATE% %TIME%
 echo.
-set /p "LAUNCH=Launch the app now? (Y/N): "
+:: Question echoed separately: under the Tee-Object logging pipeline a set /p
+:: prompt (no trailing newline) is never displayed while input is awaited.
+echo Launch the app now? Type Y then Enter:
+set /p "LAUNCH="
 if /i "!LAUNCH!"=="Y" (
     start "" pythonw main.py
     echo Starting...
