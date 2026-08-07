@@ -1,5 +1,7 @@
 faster-whisper>=1.0.0
-soundcard>=0.4.3
+# 0.4.6+ required with numpy 2.x: older soundcard calls numpy.fromstring,
+# removed in numpy 2.0 ("Capture error: The binary mode of fromstring...").
+soundcard>=0.4.6
 numpy>=1.24.0
 # PyTorch bundles CUDA 12 DLLs (cublas64_12.dll etc.) on Windows.
 # For GPU builds install torch FIRST from the CUDA index (setup.bat does this):
