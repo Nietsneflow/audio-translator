@@ -11,6 +11,10 @@ numpy>=1.24.0
 # (--index-url must NOT be combined with -r: it replaces PyPI entirely and the
 # PyTorch index does not host the other packages below.)
 torch>=2.0.0
+# Current cuBLAS for newer GPUs (RTX 50xx): torch cu121's bundled copy is too
+# old and fails with CUBLAS_STATUS_NOT_SUPPORTED; transcriber.py preloads this
+# wheel's DLLs so they win over torch's. Harmless on CPU-only machines.
+nvidia-cublas-cu12>=12.4
 psutil>=5.9.0
 pynvml>=11.0.0
 # Offline English → Russian translation (no torch/transformers dependency).

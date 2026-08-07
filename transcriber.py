@@ -76,6 +76,50 @@ def _register_cuda_dll_dirs() -> None:
         pass
 
 
+def _preload_cuda_dlls() -> None:
+    """Pin cuBLAS/cuDNN to known-good copies before torch can load its own.
+
+    Windows resolves DLLs by module name process-wide — the FIRST module
+    loaded under a given base name wins for everyone, even later absolute-path
+    loads.  torch's import explicitly loads every DLL in torch\\lib, and its
+    cu121-era cublas64_12.dll predates newer GPU architectures: on an RTX 50xx
+    (Blackwell) every ctranslate2 matmul then fails with
+    CUBLAS_STATUS_NOT_SUPPORTED.  So, before ANY torch import (note:
+    _register_cuda_dll_dirs imports torch — this must run first):
+      - cuBLAS from the nvidia-cublas-cu12 wheel (current, supports new GPUs)
+      - cuDNN bundled inside the ctranslate2 wheel (the copy ctranslate2 is
+        tested against; torch's older one must not claim the name first)
+    torch itself is unaffected: this app only calls torch.cuda.is_available().
+    """
+    if sys.platform != "win32":
+        return
+    log = get_logger(__name__)
+
+    def _load_all(dir_path: str, names: tuple) -> None:
+        for name in names:
+            dll = os.path.join(dir_path, name)
+            if os.path.isfile(dll):
+                try:
+                    ctypes.WinDLL(dll)
+                    log.debug("Preloaded %s", dll)
+                except OSError as exc:
+                    log.warning("Could not preload %s: %s", dll, exc)
+
+    for path in sys.path:
+        cublas_bin = os.path.join(path, "nvidia", "cublas", "bin")
+        if os.path.isdir(cublas_bin):
+            # Lt first — cublas64 links against it.
+            _load_all(cublas_bin, ("cublasLt64_12.dll", "cublas64_12.dll"))
+            break
+    try:
+        import ctranslate2  # loads ctranslate2.dll + its bundled cudnn deps
+        ct2_dir = os.path.dirname(ctranslate2.__file__)
+        _load_all(ct2_dir, ("cudnn64_9.dll",))
+    except ImportError:
+        pass
+
+
+_preload_cuda_dlls()
 _register_cuda_dll_dirs()
 
 log = get_logger(__name__)
@@ -536,6 +580,9 @@ class TranscriberThread(threading.Thread):
             or "library" in err_str
             or "out of memory" in err_str
             or "bad allocation" in err_str
+            or "cublas" in err_str      # e.g. CUBLAS_STATUS_NOT_SUPPORTED on a
+            or "cudnn" in err_str       # GPU newer than the loaded CUDA libs
+            or "cuda" in err_str
             or isinstance(exc, MemoryError)
         )
         if ram_pressure:
